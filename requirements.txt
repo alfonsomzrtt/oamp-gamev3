@@ -16,4 +16,5 @@ mediapipe==0.10.35
 ultralytics
 pyserial
 requests
+websocket-client
 ipython

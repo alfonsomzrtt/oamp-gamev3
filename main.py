@@ -8,6 +8,7 @@ import time
 import sys
 import threading
 import traceback
+import queue
 from queue import Queue
 from dotenv import load_dotenv
 from pathlib import Path
@@ -67,6 +68,7 @@ BUTTON_MODE = os.getenv('BUTTON_MODE', 'false').lower() == 'true'
 HIDE_CAMERA = os.getenv('HIDE_CAMERA', 'false').lower() == 'true'
 
 # Camera settings
+CAMERA_INDEX = int(os.getenv('CAMERA_INDEX', '0'))
 CAMERA_MIRROR_X = os.getenv('CAMERA_MIRROR_X', 'true').lower() == 'true'
 CAMERA_MIRROR_Y = os.getenv('CAMERA_MIRROR_Y', 'false').lower() == 'true'
 try:
@@ -75,6 +77,48 @@ try:
         CAMERA_ZOOM = 1.0
 except (ValueError, TypeError):
     CAMERA_ZOOM = 1.0
+
+
+def _enumerate_cameras(max_index=5):
+    """Try to open camera indices 0..max_index and return list of working indices."""
+    import cv2 as _cv2
+    available = []
+    for i in range(max_index):
+        try:
+            if platform.system() == 'Windows':
+                c = _cv2.VideoCapture(i, _cv2.CAP_DSHOW)
+            else:
+                c = _cv2.VideoCapture(i)
+            if c.isOpened():
+                ret, _ = c.read()
+                if ret:
+                    available.append(i)
+                c.release()
+        except Exception:
+            pass
+    return available
+
+
+def _save_env_value(key, value):
+    """Update or append a key=value pair in the .env file."""
+    env_path = Path('.') / '.env'
+    lines = []
+    if env_path.exists():
+        with open(env_path, 'r') as f:
+            lines = f.readlines()
+    updated = False
+    new_lines = []
+    for line in lines:
+        stripped = line.strip()
+        if stripped.split('=')[0] == key if '=' in stripped else False:
+            new_lines.append(f"{key}={value}\n")
+            updated = True
+        else:
+            new_lines.append(line)
+    if not updated:
+        new_lines.append(f"{key}={value}\n")
+    with open(env_path, 'w') as f:
+        f.writelines(new_lines)
 
 # PC mode: "competition" = duel / tournament mode selection after UID scan
 #          "training" = solo (TimeIn directly), UID optional
@@ -103,6 +147,13 @@ TOURNAMENT_ROOM_CODE = ''
 TOURNAMENT_OPPONENT = ''
 TOURNAMENT_IS_P1   = False
 TOURNAMENT_ROUND   = 0
+
+# WebSocket / competitive state
+_ws_client           = None   # GameWebSocket instance
+_opponent_level      = 0     # updated via WS score_update
+_opponent_blocks     = 0
+_opponent_finished   = False # set on GAME_OVER from opponent
+_opponent_name       = ''    # set from WS join/room_update
 
 # Base directory for resolving asset paths
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -176,10 +227,11 @@ def _verify_participant(uid: str, callback=None):
 
 
 def _submit_results(uid: str, payload: dict):
-    """POST /api/v1/game/submit with retry + local backup fallback."""
+    """POST /api/v1/game/submit with retry + local backup fallback. Returns the thread for joining."""
     if not API_SERVER_URL:
         _save_local_backup(f"offline_{uid}_{int(time.time())}.json", payload)
-        return
+        print(f">>> [API] No API_SERVER_URL set — saved locally")
+        return None
     def _do():
         ok = _api_post(f"{API_SERVER_URL}/api/v1/game/submit", payload, timeout=10)
         if ok:
@@ -187,7 +239,9 @@ def _submit_results(uid: str, payload: dict):
         else:
             print(f">>> [API] Submit FAILED after {_MAX_RETRIES} retries — saving locally")
             _save_local_backup(f"failed_{uid}_{int(time.time())}.json", payload)
-    threading.Thread(target=_do, daemon=True).start()
+    t = threading.Thread(target=_do, daemon=True)
+    t.start()
+    return t
 
 
 def _save_training_locally(payload: dict):
@@ -238,6 +292,169 @@ def _send_tournament_event(room_code: str, event_type: str, player_num: int = 0,
         except Exception as e:
             print(f">>> [TOURNAMENT] Event '{event_type}' failed: {e}")
     threading.Thread(target=_do, daemon=True).start()
+
+
+def _submit_duel_result(room_code: str, player_uid: str, player_num: int, score: float):
+    """POST /api/rooms/{code}/result — submit duel score, server determines winner when both submit."""
+    if not API_SERVER_URL:
+        return
+    def _do():
+        try:
+            import requests as _r
+            payload = {
+                "player_uid": player_uid,
+                "player_num": player_num,
+                "score":      score,
+            }
+            resp = _r.post(f"{API_SERVER_URL}/api/rooms/{room_code}/result", json=payload, timeout=5)
+            if 200 <= resp.status_code < 300:
+                data = resp.json()
+                match_status = data.get("match_status", "")
+                print(f">>> [DUEL] Result submitted — match_status: {match_status}")
+            else:
+                print(f">>> [DUEL] Submit failed — status {resp.status_code}: {resp.text}")
+        except Exception as e:
+            print(f">>> [DUEL] Submit failed: {e}")
+    threading.Thread(target=_do, daemon=True).start()
+
+
+def _poll_duel_result(room_code: str, callback=None, interval: float = 3.0, max_attempts: int = 60):
+    """GET /api/rooms/{code}/result — poll until winner is decided or timeout."""
+    if not API_SERVER_URL:
+        if callback:
+            callback(False, {})
+        return
+    def _do():
+        for _ in range(max_attempts):
+            try:
+                import requests as _r
+                resp = _r.get(f"{API_SERVER_URL}/api/rooms/{room_code}/result", timeout=5)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    if data.get("winner", "") != "":
+                        print(f">>> [DUEL] Winner decided: {data['winner']}")
+                        if callback:
+                            callback(True, data)
+                        return
+            except Exception:
+                pass
+            time.sleep(interval)
+        print(f">>> [DUEL] Polling timed out after {max_attempts} attempts")
+        if callback:
+            callback(False, {})
+    threading.Thread(target=_do, daemon=True).start()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  WebSocket Client for real-time match communication
+# ─────────────────────────────────────────────────────────────────────────────
+
+_WS_RECONNECT_DELAYS = [1, 2, 4, 8, 16]  # exponential backoff, max 16s
+
+class GameWebSocket:
+    """Threaded WebSocket client for real-time match events.
+
+    Connects to /ws/match/{room_code}?role=player&player_id=P{num}&player_name={name}&player_num={num}
+    and dispatches received messages to the Tkinter app via callback.
+    """
+
+    def __init__(self, room_code, player_num, player_name, on_message):
+        self.room_code = room_code
+        self.player_num = player_num
+        self.player_name = player_name
+        self.on_message = on_message  # callable(dict) -> None, called from any thread
+        self._ws = None
+        self._connected = False
+        self._should_reconnect = True
+        self._lock = threading.Lock()
+        self._thread = None
+
+    def _build_url(self):
+        base = API_SERVER_URL.replace("http://", "ws://").replace("https://", "wss://").rstrip("/")
+        pid = f"P{self.player_num}"
+        return (
+            f"{base}/ws/match/{self.room_code}"
+            f"?role=player&player_id={pid}"
+            f"&player_name={self.player_name}"
+            f"&player_num={self.player_num}"
+        )
+
+    def connect(self):
+        self._should_reconnect = True
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _run(self):
+        try:
+            import websocket as _ws_mod
+        except ImportError:
+            print(">>> [WS] websocket-client not installed, skipping WS connection")
+            return
+        attempt = 0
+        while self._should_reconnect:
+            try:
+                url = self._build_url()
+                print(f">>> [WS] Connecting to {url}")
+                self._ws = _ws_mod.WebSocketApp(
+                    url,
+                    on_open=self._on_open,
+                    on_message=self._on_msg,
+                    on_error=self._on_err,
+                    on_close=self._on_close,
+                )
+                self._ws.run_forever(ping_interval=30, ping_timeout=10)
+            except Exception as e:
+                print(f">>> [WS] Connection error: {e}")
+            if not self._should_reconnect:
+                break
+            delay = _WS_RECONNECT_DELAYS[min(attempt, len(_WS_RECONNECT_DELAYS) - 1)]
+            print(f">>> [WS] Reconnecting in {delay}s...")
+            time.sleep(delay)
+            attempt += 1
+        print(">>> [WS] Disconnected permanently")
+
+    def _on_open(self, ws):
+        self._connected = True
+        print(">>> [WS] Connected")
+        attempt = 0
+
+    def _on_msg(self, ws, message):
+        try:
+            data = _json.loads(message)
+            self.on_message(data)
+        except Exception as e:
+            print(f">>> [WS] Parse error: {e}")
+
+    def _on_err(self, ws, error):
+        print(f">>> [WS] Error: {error}")
+
+    def _on_close(self, ws, close_status, close_msg):
+        self._connected = False
+        print(f">>> [WS] Closed: {close_status} {close_msg}")
+
+    def send(self, data: dict):
+        with self._lock:
+            if self._ws:
+                try:
+                    self._ws.send(_json.dumps(data))
+                except Exception as e:
+                    print(f">>> [WS] Send error: {e}")
+
+    def close(self):
+        self._should_reconnect = False
+        self._connected = False
+        if self._ws:
+            try:
+                self._ws.close()
+            except Exception:
+                pass
+
+    @property
+    def connected(self):
+        return self._connected
+
+
+_ws_client = None  # global WS client instance
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -606,6 +823,94 @@ def play_audio(wav):
     sd.play(data, samplerate)
     sd.wait()
 
+
+def _generate_tone(freq, duration, sample_rate=22050, volume=0.3, harmonics=None):
+    """Generate a tone with ADSR envelope and optional harmonics."""
+    t = np.linspace(0, duration, int(sample_rate * duration), endpoint=False)
+    wave = volume * np.sin(2 * np.pi * freq * t)
+    if harmonics:
+        for h_amp, h_mult in harmonics:
+            wave += volume * h_amp * np.sin(2 * np.pi * freq * h_mult * t)
+    atk = min(int(0.015 * sample_rate), len(t) // 4)
+    rel = min(int(0.04 * sample_rate), len(t) // 3)
+    if atk > 1:
+        wave[:atk] *= np.linspace(0, 1, atk)
+    if rel > 1:
+        wave[-rel:] *= np.linspace(1, 0, rel)
+    return wave
+
+
+def play_sfx(effect):
+    """Play a short SFX tone. Effects: 'amazing', 'great', 'solid', 'good', 'keep_going', 'dont_give_up', 'next_level', 'complete', 'countdown', 'skip'."""
+    SR = 22050
+    H = lambda a, m: (a, m)
+    if effect == 'amazing':
+        tone = np.concatenate([
+            _generate_tone(880, 0.1, SR, 0.35, [H(0.3, 2)]),
+            np.zeros(int(SR * 0.03)),
+            _generate_tone(1100, 0.1, SR, 0.35, [H(0.3, 2)]),
+            np.zeros(int(SR * 0.03)),
+            _generate_tone(1320, 0.2, SR, 0.4, [H(0.25, 2), H(0.15, 3)]),
+        ])
+    elif effect == 'great':
+        tone = np.concatenate([
+            _generate_tone(660, 0.1, SR, 0.35, [H(0.3, 2)]),
+            np.zeros(int(SR * 0.03)),
+            _generate_tone(880, 0.2, SR, 0.38, [H(0.25, 2), H(0.12, 3)]),
+        ])
+    elif effect == 'solid':
+        tone = np.concatenate([
+            _generate_tone(660, 0.08, SR, 0.3, [H(0.25, 2)]),
+            np.zeros(int(SR * 0.02)),
+            _generate_tone(790, 0.15, SR, 0.3, [H(0.2, 2)]),
+        ])
+    elif effect == 'good':
+        tone = _generate_tone(660, 0.25, SR, 0.3, [H(0.2, 2)])
+    elif effect == 'keep_going':
+        tone = np.concatenate([
+            _generate_tone(440, 0.1, SR, 0.25, [H(0.15, 2)]),
+            np.zeros(int(SR * 0.03)),
+            _generate_tone(520, 0.1, SR, 0.25, [H(0.15, 2)]),
+            np.zeros(int(SR * 0.03)),
+            _generate_tone(440, 0.15, SR, 0.28, [H(0.15, 2)]),
+        ])
+    elif effect == 'dont_give_up':
+        tone = np.concatenate([
+            _generate_tone(392, 0.12, SR, 0.25, [H(0.2, 2)]),
+            np.zeros(int(SR * 0.04)),
+            _generate_tone(349, 0.25, SR, 0.3, [H(0.2, 2), H(0.1, 3)]),
+        ])
+    elif effect == 'next_level':
+        tone = np.concatenate([
+            _generate_tone(523, 0.06, SR, 0.25, [H(0.2, 2)]),
+            _generate_tone(659, 0.06, SR, 0.28, [H(0.2, 2)]),
+            np.zeros(int(SR * 0.02)),
+            _generate_tone(784, 0.15, SR, 0.35, [H(0.25, 2), H(0.12, 3)]),
+        ])
+    elif effect == 'complete':
+        tone = np.concatenate([
+            _generate_tone(523, 0.1, SR, 0.3, [H(0.2, 2)]),
+            _generate_tone(659, 0.1, SR, 0.32, [H(0.2, 2)]),
+            _generate_tone(784, 0.1, SR, 0.35, [H(0.2, 2), H(0.12, 3)]),
+            np.zeros(int(SR * 0.04)),
+            _generate_tone(1047, 0.35, SR, 0.42, [H(0.18, 2), H(0.1, 3), H(0.06, 4)]),
+        ])
+    elif effect == 'countdown':
+        tone = _generate_tone(440, 0.35, SR, 0.35, [H(0.15, 2), H(0.08, 3)])
+    elif effect == 'skip':
+        tone = np.concatenate([
+            _generate_tone(523, 0.04, SR, 0.2, [H(0.15, 2)]),
+            np.zeros(int(SR * 0.01)),
+            _generate_tone(392, 0.1, SR, 0.22, [H(0.15, 2)]),
+        ])
+    else:
+        return
+
+    try:
+        sd.play(tone.reshape(-1, 1), SR)
+    except Exception:
+        pass
+
 try:
     import mediapipe as mp
 except Exception as e:
@@ -645,24 +950,31 @@ _THEME = os.getenv('THEME', 'dark').lower()
 def _theme_color(dark_val, light_val):
     return dark_val if _THEME == 'dark' else light_val
 
-# Refined modern palette — high contrast, accessible, less aggressive than pure red
-_CLR_BG            = _theme_color("#0F0F0F", "#FFFFFF")
-_CLR_CARD          = _theme_color("#1A1A1A", "#F8F9FA")
-_CLR_ACCENT        = "#E63946"   # deep crimson — energetic but refined
+# Playful-but-clean palette — warm, high-energy for kids' events
+_CLR_BG            = _theme_color("#111117", "#F8F9FC")
+_CLR_CARD          = _theme_color("#1C1C26", "#FFFFFF")
+_CLR_ACCENT        = "#E63946"   # deep crimson — energetic
 _CLR_ACCENT2       = "#C1121F"   # darker crimson hover
 _CLR_TEXT          = _theme_color("#F1F5F9", "#0F172A")
 _CLR_MUTED         = _theme_color("#94A3B8", "#64748B")
 _CLR_BORDER        = "#E63946"   # accent border
-_CLR_SUBTLE_BORDER = _theme_color("#2D2D2D", "#E9ECEF")
-_CLR_TIMER_BG      = _theme_color("#1A1A1A", "#F8F9FA")
+_CLR_SUBTLE_BORDER = _theme_color("#2D2D3A", "#E2E8F0")
+_CLR_TIMER_BG      = _theme_color("#1C1C26", "#FFFFFF")
 _CLR_DANGER        = "#E63946"
 _CLR_DANGER_BG     = _theme_color("#1A0505", "#FFF0F0")
-_CLR_SUCCESS       = "#2A9D8F"   # teal
-_CLR_SUCCESS_BG    = _theme_color("#0A1F1C", "#E6F7F5")
-_CLR_SUCCESS_HOVER = _theme_color("#236C63", "#B8E0D9")
+_CLR_SUCCESS       = "#22C55E"   # bright green — visible, rewarding
+_CLR_SUCCESS_BG    = _theme_color("#052E16", "#DCFCE7")
+_CLR_SUCCESS_HOVER = _theme_color("#16A34A", "#86EFAC")
 _CLR_DANGER_HOVER  = "#9B2226"
 _CLR_WARNING       = "#F4A261"   # warm amber
-_CLR_TEAL          = _theme_color("#94A3B8", "#64748B")
+_CLR_GOLD          = "#FFB800"   # gold — for scores, stars, highlights
+_CLR_GOLD_DARK     = "#D49B00"   # darker gold hover
+_CLR_TEAL_SAFE     = "#34D399"   # mint green — timer safe zone
+_CLR_ORANGE_WARN   = "#FB923C"   # orange — timer warning zone
+_CLR_FROST         = _theme_color("#FFFFFF", "#F1F5F9")  # overlay/frost
+_CLR_LEVEL_DONE    = "#22C55E"   # green badge for completed levels
+_CLR_LEVEL_ACTIVE  = "#E63946"   # red badge for current level
+_CLR_LEVEL_UPCOMING = _theme_color("#2D2D3A", "#E2E8F0")  # gray upcoming
 
 # Corner radii — modern but not bubbly
 _CORNER_RADIUS       = 8
@@ -736,119 +1048,278 @@ class App_Input(customtkinter.CTk): #CTkToplevel
         super().__init__()
 
         self.title("Block Design Test")
-        self.geometry("520x680")
+        self.geometry("640x780")
         self.configure(fg_color=_CLR_BG)
-        self.resizable(0, 0)
+        self.minsize(480, 600)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
+        # ── Scrollable content ──────────────────────────────────────────────
         self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(1, weight=1)
 
-        # ── Title Block ──────────────────────────────────────────────────────
-        customtkinter.CTkLabel(
-            self,
-            text="BLOCK DESIGN TEST",
-            font=(_FONT_PRIMARY[0], 34, "bold"),
-            text_color=_CLR_TEXT,
-        ).grid(row=0, column=0, pady=(40, 0), sticky="n")
-        customtkinter.CTkLabel(
-            self,
-            text="Otak Atik Tournament",
-            font=(_FONT_PRIMARY[0], 14),
-            text_color=_CLR_ACCENT,
-        ).grid(row=1, column=0, pady=(6, 0), sticky="n")
+# Fixed title bar (always visible)
+        title_bar = customtkinter.CTkFrame(self, fg_color=_CLR_CARD, corner_radius=0, height=64, border_width=0)
+        title_bar.grid(row=0, column=0, sticky="ew")
+        title_bar.grid_columnconfigure(0, weight=1)
+        title_bar.grid_columnconfigure(1, weight=0)
+        title_bar.grid_propagate(False)
 
-        # Theme toggle (top-right corner)
+        customtkinter.CTkLabel(
+            title_bar, text="BLOCK DESIGN TEST",
+            font=(_FONT_PRIMARY[0], 22, "bold"), text_color=_CLR_TEXT,
+        ).grid(row=0, column=0, padx=20, sticky="w")
+
+        customtkinter.CTkLabel(
+            title_bar, text="Otak Atik Tournament",
+            font=(_FONT_PRIMARY[0], 12), text_color=_CLR_ACCENT,
+        ).grid(row=1, column=0, padx=20, sticky="w")
+
+        # Theme toggle (top-right)
         theme_label = "Light" if _THEME == "dark" else "Dark"
         self.theme_btn = customtkinter.CTkButton(
-            self, text=theme_label,
+            title_bar, text=theme_label,
             command=self._toggle_theme,
             font=(_FONT_PRIMARY[0], 11, "bold"),
-            fg_color=_CLR_CARD, hover_color=_CLR_SUBTLE_BORDER,
+            fg_color=_CLR_BG, hover_color=_CLR_SUBTLE_BORDER,
             text_color=_CLR_TEXT,
-            corner_radius=_CORNER_RADIUS_PILL, height=30, width=70,
+            corner_radius=_CORNER_RADIUS_PILL, height=32, width=64,
         )
-        self.theme_btn.place(relx=0.96, rely=0.03, anchor="ne")
+        self.theme_btn.grid(row=0, column=1, rowspan=2, padx=(0, 16), sticky="e")
 
-        # Refined accent line — full width
-        line = customtkinter.CTkFrame(self, fg_color=_CLR_ACCENT, height=3, corner_radius=0)
-        line.grid(row=2, column=0, sticky="ew", padx=0, pady=(24, 32))
+        # Scrollable content area
+        self._scroll = customtkinter.CTkScrollableFrame(self, fg_color=_CLR_BG, corner_radius=0)
+        self._scroll.grid(row=1, column=0, sticky="nsew")
+        self._scroll.grid_columnconfigure(0, weight=1)
+
+        sx = 20  # side padding inside scroll
+        row = [0]  # mutable counter for grid row
+
+        def next_row():
+            r = row[0]
+            row[0] += 1
+            return r
 
         # ── UID Section ──────────────────────────────────────────────────────
         customtkinter.CTkLabel(
-            self, text="NOMOR PESERTA",
-            font=(_FONT_PRIMARY[0], 12, "bold"),
-            text_color=_CLR_MUTED,
-        ).grid(row=3, column=0, sticky="w", padx=28, pady=(0, 8))
+            self._scroll, text="NOMOR PESERTA",
+            font=(_FONT_PRIMARY[0], 11, "bold"), text_color=_CLR_MUTED,
+        ).grid(row=next_row(), column=0, sticky="w", padx=sx, pady=(16, 6))
 
-        self.textbox_frame_uid = MyTextboxFrame(self, "UID", values=" ")
-        self.textbox_frame_uid.grid(row=4, column=0, sticky="ew", padx=28, pady=(0, 12))
+        self.textbox_frame_uid = MyTextboxFrame(self._scroll, "UID", values=" ")
+        self.textbox_frame_uid.grid(row=next_row(), column=0, sticky="ew", padx=sx, pady=(0, 8))
         self.textbox_frame_uid.bind_return(self._cek_uid)
 
         self.cek_uid_btn = customtkinter.CTkButton(
-            self, text="CEK",
+            self._scroll, text="CEK",
             command=self._cek_uid,
-            font=(_FONT_PRIMARY[0], 15, "bold"),
+            font=(_FONT_PRIMARY[0], 14, "bold"),
             fg_color=_CLR_ACCENT, hover_color=_CLR_ACCENT2,
             text_color=_CLR_TEXT,
-            corner_radius=_CORNER_RADIUS, height=52,
+            corner_radius=_CORNER_RADIUS, height=44,
         )
-        self.cek_uid_btn.grid(row=5, column=0, sticky="ew", padx=28, pady=(0, 20))
+        self.cek_uid_btn.grid(row=next_row(), column=0, sticky="ew", padx=sx, pady=(0, 10))
 
-        # ── Participant Info Box ─────────────────────────────────────────────
+        # -- Participant Info Box --
         self.info_box = customtkinter.CTkFrame(
-            self, fg_color=_CLR_CARD, corner_radius=_CORNER_RADIUS,
+            self._scroll, fg_color=_CLR_CARD, corner_radius=_CORNER_RADIUS,
             border_width=1, border_color=_CLR_SUBTLE_BORDER,
         )
-        self.info_box.grid(row=6, column=0, sticky="ew", padx=28, pady=(0, 0))
+        self.info_box.grid(row=next_row(), column=0, sticky="ew", padx=sx, pady=(0, 0))
         self.info_box.grid_columnconfigure(0, weight=1)
-        self.info_box.grid_remove()  # Hidden until UID verified
+        self.info_box.grid_remove()
 
         self.participant_info = customtkinter.CTkLabel(
-            self.info_box,
-            text="Belum ada peserta",
-            font=(_FONT_PRIMARY[0], 14),
-            text_color=_CLR_MUTED,
+            self.info_box, text="Belum ada peserta",
+            font=(_FONT_PRIMARY[0], 13), text_color=_CLR_MUTED,
         )
-        self.participant_info.grid(row=0, column=0, padx=20, pady=(16, 6), sticky="w")
+        self.participant_info.grid(row=0, column=0, padx=16, pady=(12, 4), sticky="w")
 
         self.reset_btn = customtkinter.CTkButton(
             self.info_box, text="Ganti",
             command=self._reset_scan,
             font=(_FONT_PRIMARY[0], 11),
             fg_color="transparent", hover_color=_CLR_SUBTLE_BORDER,
-            text_color=_CLR_MUTED, height=26, width=64,
+            text_color=_CLR_MUTED, height=24, width=56,
             corner_radius=_CORNER_RADIUS_SMALL,
         )
-        self.reset_btn.grid(row=1, column=0, padx=20, pady=(0, 14), sticky="w")
+        self.reset_btn.grid(row=1, column=0, padx=16, pady=(0, 10), sticky="w")
 
-        # Status text below info box
         self.uid_status = customtkinter.CTkLabel(
-            self, text="",
-            font=(_FONT_PRIMARY[0], 13), text_color=_CLR_ACCENT,
+            self._scroll, text="",
+            font=(_FONT_PRIMARY[0], 12), text_color=_CLR_ACCENT,
         )
-        self.uid_status.grid(row=7, column=0, padx=28, pady=(10, 0), sticky="w")
+        self.uid_status.grid(row=next_row(), column=0, padx=sx, pady=(6, 0), sticky="w")
 
-        # ── Spacer ───────────────────────────────────────────────────────────
-        spacer = customtkinter.CTkFrame(self, fg_color="transparent", height=20)
-        spacer.grid(row=8, column=0, sticky="ew")
+        # ══════════════════════════════════════════════════════════════════════
+        # ── CAMERA SETUP ── Prominent, bordered, always visible ──────────────
+        # ══════════════════════════════════════════════════════════════════════
+        cam_card = customtkinter.CTkFrame(
+            self._scroll, fg_color=_CLR_CARD, corner_radius=_CORNER_RADIUS,
+            border_width=2, border_color=_CLR_ACCENT,
+        )
+        cam_card.grid(row=next_row(), column=0, sticky="ew", padx=sx, pady=(14, 0))
+        cam_card.grid_columnconfigure(0, weight=1)
+        cam_card.grid_columnconfigure(1, weight=0)
+
+        # -- Header row: title + status --
+        cam_hdr = customtkinter.CTkFrame(cam_card, fg_color="transparent")
+        cam_hdr.grid(row=0, column=0, columnspan=2, sticky="ew", padx=14, pady=(12, 6))
+        cam_hdr.grid_columnconfigure(0, weight=1)
+
+        customtkinter.CTkLabel(
+            cam_hdr, text="PENGATURAN KAMERA",
+            font=(_FONT_PRIMARY[0], 14, "bold"), text_color=_CLR_ACCENT,
+        ).grid(row=0, column=0, sticky="w")
+
+        self.cam_status_label = customtkinter.CTkLabel(
+            cam_hdr, text="Memuat...",
+            font=(_FONT_PRIMARY[0], 11), text_color=_CLR_MUTED,
+        )
+        self.cam_status_label.grid(row=0, column=1, sticky="e")
+
+        # -- Camera preview (left column) --
+        preview_col = customtkinter.CTkFrame(cam_card, fg_color="transparent")
+        preview_col.grid(row=1, column=0, sticky="nsew", padx=(14, 6), pady=(0, 12))
+        preview_col.grid_columnconfigure(0, weight=1)
+
+        self.cam_preview_label = customtkinter.CTkLabel(
+            preview_col, text="Memulai kamera...",
+            font=(_FONT_PRIMARY[0], 13), text_color=_CLR_MUTED,
+            fg_color="#111111", corner_radius=_CORNER_RADIUS,
+        )
+        self.cam_preview_label.grid(row=0, column=0, sticky="ew")
+        self.cam_preview_label.configure(height=240)
+
+        # Detection result (below preview)
+        self.detect_result = customtkinter.CTkLabel(
+            preview_col, text="",
+            font=(_FONT_PRIMARY[0], 12), text_color=_CLR_MUTED,
+            wraplength=280,
+        )
+        self.detect_result.grid(row=1, column=0, pady=(4, 0), sticky="w")
+
+        # -- Controls (right column) --
+        ctrl_col = customtkinter.CTkFrame(cam_card, fg_color="transparent")
+        ctrl_col.grid(row=1, column=1, sticky="nsew", padx=(0, 14), pady=(0, 12))
+        ctrl_col.grid_columnconfigure(0, weight=1)
+
+        # Camera device selector
+        customtkinter.CTkLabel(
+            ctrl_col, text="Sumber Kamera",
+            font=(_FONT_PRIMARY[0], 12, "bold"), text_color=_CLR_TEXT,
+        ).grid(row=0, column=0, sticky="w", pady=(0, 4))
+
+        self._detecting_cameras = True
+        self._available_cameras = []
+        self.cam_dropdown = customtkinter.CTkComboBox(
+            ctrl_col,
+            values=["Mendeteksi..."],
+            command=self._on_camera_change,
+            font=(_FONT_PRIMARY[0], 11),
+            fg_color=_CLR_BG, border_color=_CLR_SUBTLE_BORDER,
+            height=34,
+        )
+        self.cam_dropdown.grid(row=1, column=0, sticky="ew", pady=(0, 10))
+
+        # Mirror checkboxes (side by side)
+        mirror_row = customtkinter.CTkFrame(ctrl_col, fg_color="transparent")
+        mirror_row.grid(row=2, column=0, sticky="ew", pady=(0, 8))
+        mirror_row.grid_columnconfigure((0, 1), weight=1)
+
+        self.mirror_x_var = customtkinter.BooleanVar(value=CAMERA_MIRROR_X)
+        customtkinter.CTkCheckBox(
+            mirror_row, text="Mirror ↔",
+            variable=self.mirror_x_var, font=(_FONT_PRIMARY[0], 12),
+            fg_color=_CLR_ACCENT, hover_color=_CLR_ACCENT2,
+            command=self._on_mirror_change,
+        ).grid(row=0, column=0, sticky="w")
+
+        self.mirror_y_var = customtkinter.BooleanVar(value=CAMERA_MIRROR_Y)
+        customtkinter.CTkCheckBox(
+            mirror_row, text="Mirror ↕",
+            variable=self.mirror_y_var, font=(_FONT_PRIMARY[0], 12),
+            fg_color=_CLR_ACCENT, hover_color=_CLR_ACCENT2,
+            command=self._on_mirror_change,
+        ).grid(row=0, column=1, sticky="w")
+
+        # Zoom slider
+        customtkinter.CTkLabel(
+            ctrl_col, text="Zoom",
+            font=(_FONT_PRIMARY[0], 12, "bold"), text_color=_CLR_TEXT,
+        ).grid(row=3, column=0, sticky="w", pady=(0, 2))
+
+        zoom_row = customtkinter.CTkFrame(ctrl_col, fg_color="transparent")
+        zoom_row.grid(row=4, column=0, sticky="ew", pady=(0, 4))
+        zoom_row.grid_columnconfigure(0, weight=1)
+
+        self.zoom_slider = customtkinter.CTkSlider(
+            zoom_row, from_=0.5, to=3.0, number_of_steps=25,
+            command=self._on_zoom_change,
+        )
+        self.zoom_slider.set(CAMERA_ZOOM)
+        self.zoom_slider.grid(row=0, column=0, sticky="ew")
+
+        self.zoom_label = customtkinter.CTkLabel(
+            zoom_row, text=f"{CAMERA_ZOOM:.1f}x",
+            font=(_FONT_PRIMARY[0], 13, "bold"), text_color=_CLR_ACCENT, width=44,
+        )
+        self.zoom_label.grid(row=0, column=1, padx=(8, 0))
+
+        # Zoom presets
+        preset_row = customtkinter.CTkFrame(ctrl_col, fg_color="transparent")
+        preset_row.grid(row=5, column=0, sticky="ew", pady=(0, 10))
+        preset_row.grid_columnconfigure((0, 1, 2), weight=1)
+        for i, z in enumerate([1.0, 1.5, 2.0]):
+            customtkinter.CTkButton(
+                preset_row, text=f"{z:.1f}x",
+                command=lambda v=z: self._set_zoom(v),
+                font=(_FONT_PRIMARY[0], 11, "bold"),
+                fg_color=_CLR_BG, hover_color=_CLR_SUBTLE_BORDER,
+                text_color=_CLR_TEXT, corner_radius=_CORNER_RADIUS_SMALL, height=32,
+            ).grid(row=0, column=i, padx=(0 if i == 0 else 3, 3 if i < 2 else 0), sticky="ew")
+
+        # -- Action buttons --
+        btn_frame = customtkinter.CTkFrame(cam_card, fg_color="transparent")
+        btn_frame.grid(row=2, column=0, columnspan=2, sticky="ew", padx=14, pady=(0, 14))
+        btn_frame.grid_columnconfigure(0, weight=1)
+        btn_frame.grid_columnconfigure(1, weight=1)
+
+        self.detect_btn = customtkinter.CTkButton(
+            btn_frame, text="Deteksi Blok (Tes)",
+            command=self._test_block_detection,
+            font=(_FONT_PRIMARY[0], 13, "bold"),
+            fg_color=_CLR_SUCCESS, hover_color=_CLR_SUCCESS_HOVER,
+            text_color=_CLR_TEXT,
+            corner_radius=_CORNER_RADIUS, height=44,
+        )
+        self.detect_btn.grid(row=0, column=0, padx=(0, 6), sticky="ew")
+
+        customtkinter.CTkButton(
+            btn_frame, text="Simpan Pengaturan",
+            command=self._save_camera_settings,
+            font=(_FONT_PRIMARY[0], 13, "bold"),
+            fg_color=_CLR_ACCENT, hover_color=_CLR_ACCENT2,
+            text_color=_CLR_TEXT,
+            corner_radius=_CORNER_RADIUS, height=44,
+        ).grid(row=0, column=1, padx=(6, 0), sticky="ew")
 
         # ── Main Action Button ───────────────────────────────────────────────
         self.button = customtkinter.CTkButton(
-            self,
+            self._scroll,
             text="MULAI TES",
             command=self.button_callback,
-            font=(_FONT_PRIMARY[0], 22, "bold"),
+            font=(_FONT_PRIMARY[0], 20, "bold"),
             fg_color=_CLR_ACCENT,
             hover_color=_CLR_ACCENT2,
             text_color=_CLR_TEXT,
             corner_radius=_CORNER_RADIUS,
-            height=64,
+            height=52,
         )
-        self.button.grid(row=9, column=0, sticky="ew", padx=28, pady=(0, 12))
+        self.button.grid(row=next_row(), column=0, sticky="ew", padx=20, pady=(16, 8))
 
         # Competition mode buttons (hidden until UID verified)
-        self.mode_frame = customtkinter.CTkFrame(self, fg_color="transparent")
-        self.mode_frame.grid(row=9, column=0, sticky="ew", padx=28, pady=(0, 12))
+        self.mode_frame = customtkinter.CTkFrame(self._scroll, fg_color="transparent")
+        self.mode_frame.grid(row=row[0] - 1, column=0, sticky="ew", padx=20, pady=(16, 8))
         self.mode_frame.grid_columnconfigure((0, 1), weight=1)
         self.mode_frame.grid_remove()
 
@@ -887,7 +1358,12 @@ class App_Input(customtkinter.CTk): #CTkToplevel
             self._uid_required = True
 
     def _on_close(self):
+        self._preview_running = False
         raise SystemExit(0)
+
+    def destroy(self):
+        self._preview_running = False
+        super().destroy()
 
     def _toggle_theme(self):
         new_theme = 'light' if _THEME == 'dark' else 'dark'
@@ -895,6 +1371,174 @@ class App_Input(customtkinter.CTk): #CTkToplevel
         import tkinter.messagebox as mb
         mb.showinfo("Tema Diubah", "Restart aplikasi untuk menerapkan tema baru.")
         self.theme_btn.configure(text="Dark" if new_theme == 'light' else "Light")
+
+    # ── Camera preview loop ───────────────────────────────────────────────
+    def _start_camera_preview(self):
+        self._preview_running = True
+        self._current_imgtk = None
+        threading.Thread(target=self._preview_loop, daemon=True).start()
+        threading.Thread(target=self._detect_cameras, daemon=True).start()
+
+    def _detect_cameras(self):
+        available = _enumerate_cameras(max_index=5)
+        self._available_cameras = available
+        if available:
+            labels = [f"Kamera {i}" for i in available]
+            self.after(0, lambda: self._update_camera_dropdown(labels, available))
+        else:
+            self.after(0, lambda: self._update_camera_dropdown(["Tidak ada kamera"], []))
+
+    def _update_camera_dropdown(self, labels, indices):
+        self._detecting_cameras = False
+        self.cam_dropdown.configure(values=labels)
+        if indices:
+            current_idx = CAMERA_INDEX
+            if current_idx in indices:
+                sel_idx = indices.index(current_idx)
+                self.cam_dropdown.set(labels[sel_idx])
+            else:
+                self.cam_dropdown.set(labels[0])
+                self._switch_camera(indices[0])
+            self.cam_status_label.configure(
+                text=f"Kamera aktif — {len(indices)} terdeteksi",
+                text_color=_CLR_SUCCESS,
+            )
+        else:
+            self.cam_dropdown.set("Tidak ada kamera")
+            self.cam_status_label.configure(text="Tidak ada kamera", text_color=_CLR_DANGER)
+
+    def _on_camera_change(self, choice):
+        if self._detecting_cameras or not self._available_cameras:
+            return
+        idx = self._available_cameras[self.cam_dropdown.cget("values").index(choice)]
+        self._switch_camera(idx)
+
+    def _switch_camera(self, idx):
+        global CAMERA_INDEX, cap
+        CAMERA_INDEX = idx
+        if cap is not None and cap.isOpened():
+            cap.release()
+        import platform as _pf
+        if _pf.system() == 'Windows':
+            cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
+        else:
+            cap = cv2.VideoCapture(idx)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        print(f">>> Camera switched to index {idx}")
+
+    def _on_mirror_change(self):
+        global CAMERA_MIRROR_X, CAMERA_MIRROR_Y
+        CAMERA_MIRROR_X = self.mirror_x_var.get()
+        CAMERA_MIRROR_Y = self.mirror_y_var.get()
+
+    def _on_zoom_change(self, value):
+        global CAMERA_ZOOM
+        CAMERA_ZOOM = round(value, 1)
+        self.zoom_label.configure(text=f"{CAMERA_ZOOM:.1f}x")
+
+    def _set_zoom(self, value):
+        self.zoom_slider.set(value)
+        self._on_zoom_change(value)
+
+    def _save_camera_settings(self):
+        _save_env_value('CAMERA_INDEX', str(CAMERA_INDEX))
+        _save_env_value('CAMERA_MIRROR_X', str(CAMERA_MIRROR_X).lower())
+        _save_env_value('CAMERA_MIRROR_Y', str(CAMERA_MIRROR_Y).lower())
+        _save_env_value('CAMERA_ZOOM', str(CAMERA_ZOOM))
+        import tkinter.messagebox as mb
+        mb.showinfo("Tersimpan", "Pengaturan kamera disimpan ke .env")
+
+    def _test_block_detection(self):
+        self.detect_btn.configure(state="disabled", text="Mendeteksi...")
+        self.detect_result.configure(text="Menjalankan deteksi blok...", text_color=_CLR_MUTED)
+        threading.Thread(target=self._run_detection_test, daemon=True).start()
+
+    def _run_detection_test(self):
+        try:
+            if cap is None or not cap.isOpened():
+                self.after(0, lambda: self.detect_result.configure(
+                    text="Kamera tidak tersedia", text_color=_CLR_DANGER))
+                self.after(0, lambda: self.detect_btn.configure(state="normal", text="Deteksi Blok (Tes)"))
+                return
+
+            ret, frame = cap.read()
+            if not ret or frame is None:
+                self.after(0, lambda: self.detect_result.configure(
+                    text="Gagal membaca kamera", text_color=_CLR_DANGER))
+                self.after(0, lambda: self.detect_btn.configure(state="normal", text="Deteksi Blok (Tes)"))
+                return
+
+            # Run YOLO detection
+            if USE_BANTAL_MODEL:
+                from ultralytics import YOLO as _YOLO
+                results = model_yolo(frame, verbose=False)
+                if len(results) > 0 and hasattr(results[0], 'boxes'):
+                    boxes = results[0].boxes
+                    num_blocks = len(boxes)
+                    confs = [f"{box.conf[0].cpu().numpy():.0%}" for box in boxes]
+                else:
+                    num_blocks = 0
+                    confs = []
+            else:
+                results = model_yolo(frame)
+                df = results.pandas().xyxy[0]
+                num_blocks = len(df)
+                confs = [f"{row['confidence']:.0%}" for _, row in df.iterrows()]
+
+            if num_blocks > 0:
+                conf_str = ", ".join(confs[:5])
+                msg = f"Terdeteksi {num_blocks} blok — confidence: {conf_str}"
+                color = _CLR_SUCCESS
+            else:
+                msg = "Tidak ada blok terdeteksi — coba posisikan blok di kamera"
+                color = _CLR_WARNING
+
+            self.after(0, lambda: self.detect_result.configure(text=msg, text_color=color))
+        except Exception as e:
+            self.after(0, lambda: self.detect_result.configure(
+                text=f"Error: {e}", text_color=_CLR_DANGER))
+        finally:
+            self.after(0, lambda: self.detect_btn.configure(state="normal", text="Deteksi Blok (Tes)"))
+
+    def _preview_loop(self):
+        import cv2 as _cv2
+        pw, ph = 400, 280
+        while self._preview_running:
+            try:
+                if cap is None or not cap.isOpened():
+                    time.sleep(0.2)
+                    continue
+                ret, frame = cap.read()
+                if not ret or frame is None:
+                    time.sleep(0.05)
+                    continue
+
+                frame = _cv2.cvtColor(frame, _cv2.COLOR_BGR2RGB)
+                if CAMERA_MIRROR_X:
+                    frame = _cv2.flip(frame, 1)
+                if CAMERA_MIRROR_Y:
+                    frame = _cv2.flip(frame, 0)
+                zoom = CAMERA_ZOOM
+                if zoom != 1.0:
+                    h, w = frame.shape[:2]
+                    new_w, new_h = int(w * zoom), int(h * zoom)
+                    frame = _cv2.resize(frame, (new_w, new_h), interpolation=_cv2.INTER_LINEAR)
+                    if zoom > 1.0:
+                        start_x = (new_w - w) // 2
+                        start_y = (new_h - h) // 2
+                        frame = frame[start_y:start_y + h, start_x:start_x + w]
+
+                img = Image.fromarray(frame).resize((pw, ph), Image.LANCZOS)
+                self._current_imgtk = ImageTk.PhotoImage(img)
+
+                def upd(im=None):
+                    if im and self._preview_running:
+                        self.cam_preview_label.configure(image=im)
+                self.after(0, lambda im=self._current_imgtk: upd(im))
+            except Exception:
+                pass
+            time.sleep(0.03)
 
     def report_callback_exception(self, exc, val, tb):
         log_exception("Tk callback exception (App_Input)", exc, val, tb)
@@ -1022,6 +1666,7 @@ class App_Input(customtkinter.CTk): #CTkToplevel
         self.destroy()
 
     def button_callback(self):
+        global nick_name, gender_code, age_range_code, current_participant_uid
         import tkinter.messagebox as messagebox
         try:
             uid = self.textbox_frame_uid.get().strip()
@@ -1030,7 +1675,6 @@ class App_Input(customtkinter.CTk): #CTkToplevel
                 if self._uid_required:
                     raise ValueError("UID tidak boleh kosong — tekan 'Cek UID' dulu")
                 # Training mode: use placeholder data
-                global nick_name, gender_code, age_range_code, current_participant_uid
                 nick_name = "training_user"
                 gender_code = ""
                 age_range_code = 0
@@ -1038,7 +1682,13 @@ class App_Input(customtkinter.CTk): #CTkToplevel
                 print("Name   :", nick_name)
                 print("UID    : (none — training mode)")
             elif not current_participant_uid:
-                raise ValueError("UID belum diverifikasi — tekan 'Cek UID' dulu")
+                if self._uid_required:
+                    raise ValueError("UID belum diverifikasi — tekan 'Cek UID' dulu")
+                # Training mode with unverified UID: allow, use placeholder
+                nick_name = "training_user"
+                gender_code = ""
+                age_range_code = 0
+                current_participant_uid = ""
             else:
                 print("Name   :", nick_name)
                 print("Age    :", age_range_code)
@@ -1054,6 +1704,17 @@ class App_Input(customtkinter.CTk): #CTkToplevel
             messagebox.showerror("Error", "Terjadi kesalahan saat memproses input")
 
 
+# ── Initialize camera (needed before App_Input for preview) ────────────────
+import platform as _platform_mod
+if _platform_mod.system() == 'Windows':
+    cap = cv2.VideoCapture(CAMERA_INDEX, cv2.CAP_DSHOW)
+else:
+    cap = cv2.VideoCapture(CAMERA_INDEX)
+cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+
+print(">>> Start Test ...")
+
 try:
     if PC_MODE == "training":
         nick_name = "training_user"
@@ -1062,9 +1723,11 @@ try:
         current_participant_uid = ""
         print(">>> PC_MODE=training — App_Input optional, using placeholder data")
         app_input = App_Input()
+        app_input._start_camera_preview()
         app_input.mainloop()
     else:
         app_input = App_Input()
+        app_input._start_camera_preview()
         app_input.mainloop()
 except Exception:
     print(">>> Failed while running input window. Full traceback:")
@@ -1078,14 +1741,7 @@ except Exception:
 
 #PATH_VIDEO = r"C:\Users\50575\Desktop\BDT\VIDEO_EXPERIMENT\TLL\TOP_VIEW\anom_02.mp4"
 #cap = cv2.VideoCapture(PATH_VIDEO)          #0, cv2.CAP_DSHOW
-import platform
-if platform.system() == 'Windows':
-    cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
-else:  # Linux/Mac
-    cap = cv2.VideoCapture(0)  # atau cv2.CAP_V4L2
-
-cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)      #1280   640
-cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)     #720    480
+# NOTE: Camera (cap) is now initialized in the startup block before App_Input
 
 print(">>> Start Test ...")
 
@@ -1174,7 +1830,7 @@ class YOLODetectionThread(threading.Thread):
                     if self.result_queue.full():
                         try:
                             self.result_queue.get_nowait()
-                        except:
+                        except queue.Empty:
                             pass
                     self.result_queue.put(list_tracked_objects)
                 else:
@@ -1261,7 +1917,7 @@ class SerialReaderThread(threading.Thread):
         """Get message from queue (non-blocking)"""
         try:
             return self.message_queue.get_nowait()
-        except:
+        except queue.Empty:
             return None
     
     def stop(self):
@@ -1275,6 +1931,8 @@ class TimeIn(customtkinter.CTk):
 
     def report_callback_exception(self, exc, val, tb):
         """Capture tkinter callback exceptions with full traceback."""
+        if isinstance(val, Exception) and "invalid command name" in str(val):
+            return
         log_exception("Tk callback exception (TimeIn)", exc, val, tb)
 
     def __init__(self):
@@ -1282,6 +1940,7 @@ class TimeIn(customtkinter.CTk):
         super().__init__()
         self.title("Block Design Test")
         self.configure(fg_color=_CLR_BG)
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
 
         # Set window size based on display mode
         if DISPLAY_HALF:
@@ -1299,7 +1958,7 @@ class TimeIn(customtkinter.CTk):
             
             # Create a container for the top half
             self.top_container = customtkinter.CTkFrame(self, fg_color=_CLR_BG)
-            self.top_container.grid(row=0, column=0, columnspan=2, sticky="nsew", pady=(0, 150))
+            self.top_container.grid(row=0, column=0, columnspan=2, sticky="nsew", pady=(0, 4))
             self.top_container.grid_columnconfigure(0, weight=1)
             self.top_container.grid_columnconfigure(1, weight=1)
             self.top_container.grid_rowconfigure(0, weight=1)
@@ -1354,11 +2013,25 @@ class TimeIn(customtkinter.CTk):
         self.left_side.grid_columnconfigure(1, weight=1)
 
         # ── Level Indicator ──────────────────────────────────────────────────
+        level_header = customtkinter.CTkFrame(self.left_side, fg_color="transparent")
+        level_header.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 10))
+        level_header.grid_columnconfigure(0, weight=1)
+
         self.level_text = customtkinter.CTkLabel(
-            self.left_side, text="LEVEL 1 / 8",
+            level_header, text="LEVEL 1 / 8",
             font=(_FONT_PRIMARY[0], 14, "bold"), text_color=_CLR_ACCENT,
         )
-        self.level_text.grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 10))
+        self.level_text.grid(row=0, column=0, sticky="w")
+
+        # Exit button — placed directly on window so it's always visible
+        self._exit_btn = customtkinter.CTkButton(
+            self, text="✕ Keluar",
+            font=(_FONT_PRIMARY[0], 12, "bold"), width=100, height=36,
+            fg_color=_CLR_DANGER, hover_color=_CLR_DANGER_HOVER,
+            text_color=_CLR_TEXT,
+            corner_radius=_CORNER_RADIUS, command=self._switch_player,
+        )
+        self._exit_btn.place(relx=1.0, rely=0.0, anchor="ne", x=-12, y=8)
 
         # Timer frame — Modern: rounded, accent border, dark fill
         timer_width = 120 if DISPLAY_HALF else 150
@@ -1405,13 +2078,21 @@ class TimeIn(customtkinter.CTk):
         for i in range(8):
             badge = customtkinter.CTkLabel(
                 self.level_badge_frame, text=str(i + 1),
-                font=(_FONT_PRIMARY[0], 11, "bold"),
-                width=30, height=30,
+                font=(_FONT_PRIMARY[0], 14, "bold"),
+                width=44, height=44,
                 fg_color=_CLR_CARD, text_color=_CLR_MUTED,
-                corner_radius=_CORNER_RADIUS_SMALL,
+                corner_radius=_CORNER_RADIUS,
             )
-            badge.grid(row=0, column=i, padx=3, pady=3)
+            badge.grid(row=0, column=i, padx=2, pady=2)
             self.level_badges.append(badge)
+
+        # Skip hint below level badges
+        self.skip_hint = customtkinter.CTkLabel(
+            self.left_side, text="",
+            font=(_FONT_PRIMARY[0], 11), text_color=_CLR_MUTED,
+        )
+        self.skip_hint.grid(row=4, column=0, columnspan=2, pady=(4, 0))
+        self.skip_hint.grid_remove()
 
         # Star frame (legacy, kept for compatibility — hidden by default)
         self.star_frame = customtkinter.CTkFrame(self.left_side, fg_color="transparent")
@@ -1440,7 +2121,7 @@ class TimeIn(customtkinter.CTk):
         self.design_frame_1.grid_propagate(False)
 
         # Results dashboard (hidden until test ends)
-        self.results_frame = customtkinter.CTkFrame(self.left_side, fg_color=_CLR_CARD, corner_radius=_CORNER_RADIUS, border_width=1, border_color=_CLR_SUBTLE_BORDER)
+        self.results_frame = customtkinter.CTkScrollableFrame(self.left_side, fg_color=_CLR_CARD, corner_radius=_CORNER_RADIUS, border_width=1, border_color=_CLR_SUBTLE_BORDER)
         self.results_frame.grid(row=1, column=1, padx=0, pady=0, sticky="nsew")
         self.results_frame.grid_columnconfigure(0, weight=1)
         self.results_frame.grid_remove()
@@ -1455,16 +2136,7 @@ class TimeIn(customtkinter.CTk):
             self.video_frame_0 = TextFrame(self.content_container, "Upper Table Camera")
             self.video_frame_0.grid(row=0, column=1, padx=camera_padx, pady=0, sticky="nsew")
 
-            # Detection status pill
-            self.detection_status = customtkinter.CTkLabel(
-                self.video_frame_0, text="Mencari tangan...",
-                font=(_FONT_PRIMARY[0], 10, "bold"),
-                text_color=_CLR_ACCENT, fg_color=_CLR_CARD,
-                corner_radius=_CORNER_RADIUS_PILL, width=140, height=26,
-            )
-            self.detection_status.grid(row=0, column=1, padx=(0, 10), pady=(10, 0), sticky="e")
-
-            # Camera settings button (next to title)
+            # Camera settings button (top-right of video frame)
             self.camera_settings_btn = customtkinter.CTkButton(
                 self.video_frame_0, text="Set",
                 font=(_FONT_PRIMARY[0], 10, "bold"), width=40, height=32,
@@ -1485,11 +2157,11 @@ class TimeIn(customtkinter.CTk):
         
         # Adjust image sizes to fit the frames
         if DISPLAY_HALF:
-            self.frame_width = 400
-            self.frame_height = 400
+            self.frame_width = 480
+            self.frame_height = 480
         else:
-            self.frame_width = 600
-            self.frame_height = 600
+            self.frame_width = 700
+            self.frame_height = 700
         
         # Load and resize the initial image
         IMAGE_PATH = os.path.join(BASE_DIR, 'FILES', 'TEST_1000x1000', '0Bx.jpg')
@@ -1543,7 +2215,7 @@ class TimeIn(customtkinter.CTk):
             hover_color=_CLR_ACCENT2,
             text_color=_CLR_TEXT,
             corner_radius=_CORNER_RADIUS,
-            height=64,
+            height=56,
             command=self.button_0_callback,
         )
         if DISPLAY_HALF:
@@ -1566,6 +2238,17 @@ class TimeIn(customtkinter.CTk):
                 font=(_FONT_PRIMARY[0], 12, "bold"), text_color=_CLR_ACCENT, anchor="w",
             )
             self.status_label.pack(side="left", padx=20, pady=8)
+
+            # Opponent badge (only visible in multiplayer)
+            self._opponent_badge = customtkinter.CTkLabel(
+                self.bottom_container,
+                text="", font=(_FONT_PRIMARY[0], 12, "bold"),
+                text_color=_CLR_MUTED, anchor="e",
+            )
+            if IS_MULTIPLAYER:
+                self._opponent_badge.configure(text="Lawan: --", text_color=_CLR_MUTED)
+                self._opponent_badge.pack(side="right", padx=20, pady=8)
+            self._opponent_finished_label = None
 
         #self.start_zero = time.time()
         #self.start_thumb = time.time()
@@ -1663,6 +2346,7 @@ class TimeIn(customtkinter.CTk):
         self._api_event("join_room")
         if IS_MULTIPLAYER:
             print(f">>> [API] Joined room '{ROOM_ID}' as player {PLAYER_NUM} ('{self.nick_name}')")
+            self._setup_ws_for_game()
 
     def _api_event(self, event_type: str, level: int = 0, time_sec: float = 0.0):
         if not IS_MULTIPLAYER:
@@ -1675,6 +2359,16 @@ class TimeIn(customtkinter.CTk):
             "level":       level,
             "time_sec":    round(float(time_sec), 3),
         })
+        # Also broadcast level_complete via WS for live opponent tracking
+        if event_type == "level_complete" and _ws_client and _ws_client.connected:
+            _ws_client.send({
+                "type":       "score_update",
+                "player_id":  f"P{PLAYER_NUM}",
+                "player_name": nick_name,
+                "player_num": PLAYER_NUM,
+                "game_score":  level,
+                "blocks_hit":  int(time_sec) if time_sec else 0,
+            })
 
     def _start_heartbeat(self):
         """Send heartbeat every 15s in competition mode to keep room alive."""
@@ -1706,6 +2400,108 @@ class TimeIn(customtkinter.CTk):
 
     def _stop_heartbeat(self):
         self._heartbeat_active = False
+
+    def _setup_ws_for_game(self):
+        """Connect WS for in-game opponent tracking (called if not already connected via App_Room)."""
+        global _ws_client
+        if _ws_client and _ws_client.connected:
+            _ws_client.on_message = self._on_ws_game_message
+            return
+        if not API_SERVER_URL or not CURRENT_ROOM_CODE:
+            return
+        _ws_client = GameWebSocket(
+            room_code=CURRENT_ROOM_CODE,
+            player_num=PLAYER_NUM,
+            player_name=nick_name,
+            on_message=self._on_ws_game_message,
+        )
+        _ws_client.connect()
+
+    def _on_ws_game_message(self, data: dict):
+        try:
+            self.after(0, lambda d=data: self._handle_ws_game(d))
+        except Exception:
+            pass
+
+    def _handle_ws_game(self, data: dict):
+        global _opponent_level, _opponent_blocks, _opponent_finished, _opponent_name
+        msg_type = data.get("type", "")
+
+        if msg_type == "score_update":
+            opp_num = data.get("player_num", 0)
+            if opp_num != PLAYER_NUM:
+                _opponent_level = data.get("game_score", _opponent_level)
+                _opponent_blocks = data.get("blocks_hit", _opponent_blocks)
+                _opponent_name = data.get("player_name", _opponent_name or "Lawan")
+                self._update_opponent_badge()
+
+        elif msg_type == "GAME_OVER":
+            opp_num = data.get("player_num", 0)
+            if opp_num != PLAYER_NUM:
+                _opponent_finished = True
+                _opponent_name = data.get("player_name", "Lawan")
+                self._update_opponent_badge()
+                self._show_opponent_finished_banner()
+
+        elif msg_type == "match_start":
+            pass  # Game is already running via local countdown
+
+        elif msg_type == "match_result":
+            # Instant winner notification — will also arrive via REST polling
+            winner = data.get("winner", "")
+            p1s = data.get("p1_score", 0)
+            p2s = data.get("p2_score", 0)
+            if winner:
+                self._show_match_result_banner(winner, p1s, p2s)
+
+    def _update_opponent_badge(self):
+        if not IS_MULTIPLAYER:
+            return
+        if not hasattr(self, '_opponent_badge'):
+            return
+        level_text = f"L{_opponent_level}" if _opponent_level > 0 else "--"
+        name = _opponent_name or "Lawan"
+        status = "Selesai!" if _opponent_finished else f"Level {level_text}"
+        color = "#22c55e" if _opponent_finished else _CLR_ACCENT
+        self._opponent_badge.configure(text=f"{name}: {status}", text_color=color)
+
+    def _show_opponent_finished_banner(self):
+        if not IS_MULTIPLAYER:
+            return
+        if not hasattr(self, '_opponent_finished_label') or self._opponent_finished_label is None or not self._opponent_finished_label.winfo_exists():
+            banner = customtkinter.CTkLabel(
+                self, text="⚡ Lawan Selesai! Menunggu hasilmu...",
+                font=(_FONT_PRIMARY[0], 18, "bold"), text_color="#f59e0b",
+                fg_color=_CLR_CARD, corner_radius=_CORNER_RADIUS,
+            )
+            banner.place(relx=0.5, rely=0.15, anchor="center")
+            self._opponent_finished_label = banner
+            # Keep banner visible until results dashboard replaces it (7s max)
+            self.after(7000, lambda: banner.place_forget() if banner.winfo_exists() else None)
+
+    def _show_match_result_banner(self, winner, p1_score, p2_score):
+        global _opponent_finished
+        _opponent_finished = True
+        self._update_opponent_badge()
+        # Update the duel result UI if it exists
+        if not hasattr(self, '_duel_result_label') or self._duel_result_label is None:
+            return
+        my_num = str(PLAYER_NUM)
+        try:
+            p1s = f"P1: {p1_score:.1f}" if p1_score else "P1: --"
+            p2s = f"P2: {p2_score:.1f}" if p2_score else "P2: --"
+            if hasattr(self, '_duel_p1_score_label') and self._duel_p1_score_label:
+                self._duel_p1_score_label.configure(text=p1s)
+            if hasattr(self, '_duel_p2_score_label') and self._duel_p2_score_label:
+                self._duel_p2_score_label.configure(text=p2s)
+            if winner == "draw":
+                self._duel_result_label.configure(text="SERI!", text_color=_CLR_ACCENT)
+            elif winner == my_num:
+                self._duel_result_label.configure(text="🏆 KAMU MENANG!", text_color="#22c55e")
+            else:
+                self._duel_result_label.configure(text="KAMU KALAH", text_color="#ef4444")
+        except Exception:
+            pass
 
     def preload_level_images(self):
         """Preload and cache all level images to avoid I/O lag during gameplay"""
@@ -1760,10 +2556,12 @@ class TimeIn(customtkinter.CTk):
         print("Your Cognitive Age is " + str(age_cog) + " years")
         print("Your Cognitive Fitness is " + str(visuo_spatial) + " %")
 
-        play_audio("AUDIO/selesai.wav")
-        time.sleep(3)
+        play_sfx('complete')
+        self._show_celebration("TES SELESAI!", duration=2500)
+        self.after(2500, lambda: self._finish_test(visuo_spatial, None, None, None, age_real, age_cog))
 
-        # Save participant result to API server
+    def _finish_test(self, visuo_spatial, times, avg_time_all, estimated_age, age_real, age_cog):
+        """Called after celebration flash — submit results and build dashboard."""
         try:
             global current_participant_uid
 
@@ -1781,36 +2579,59 @@ class TimeIn(customtkinter.CTk):
                 "nick_name":     name,
                 "gender":        gender,
                 "age":           real_age,
-                "task_01":       float(times[0]) if len(times) > 0 else None,
-                "task_02":       float(times[1]) if len(times) > 1 else None,
-                "task_03":       float(times[2]) if len(times) > 2 else None,
-                "task_04":       float(times[3]) if len(times) > 3 else None,
-                "task_05":       float(times[4]) if len(times) > 4 else None,
-                "task_06":       float(times[5]) if len(times) > 5 else None,
-                "task_07":       float(times[6]) if len(times) > 6 else None,
-                "task_08":       float(times[7]) if len(times) > 7 else None,
+                "task01":       float(times[0]) if len(times) > 0 else 0.0,
+                "task02":       float(times[1]) if len(times) > 1 else 0.0,
+                "task03":       float(times[2]) if len(times) > 2 else 0.0,
+                "task04":       float(times[3]) if len(times) > 3 else 0.0,
+                "task05":       float(times[4]) if len(times) > 4 else 0.0,
+                "task06":       float(times[5]) if len(times) > 5 else 0.0,
+                "task07":       float(times[6]) if len(times) > 6 else 0.0,
+                "task08":       float(times[7]) if len(times) > 7 else 0.0,
                 "task_avg":      avg_time_all,
                 "cognitive_age": estimated_age,
                 "visuo_spatial": visuo_spatial,
             }
 
             if uid:
-                _submit_results(uid, payload)
+                result_thread = _submit_results(uid, payload)
             else:
                 _save_training_locally(payload)
-                print(f">>> [LOCAL] Training results saved without UID")
+                print(f">>> [LOCAL] Training results saved without UID (uid={uid!r})")
+
+            # Compute standardized score for tournament/duel
+            level_reached = sum(1 for t in times if t > 0)
+            dexterity_score = (float(estimated_age) / float(real_age)) if real_age > 0 and estimated_age > 0 else 0.0
+            if dexterity_score > 2.0:
+                dexterity_score = 2.0
+            computed_score = (level_reached * 10) + (visuo_spatial / 100.0 * 50) + (dexterity_score * 0.2)
 
             # Tournament cup: report match finished with score
             if TOURNAMENT_MODE and CURRENT_ROOM_CODE:
                 player_num = 1 if TOURNAMENT_IS_P1 else 2
-                score = float(visuo_spatial)
                 _send_tournament_event(
                     CURRENT_ROOM_CODE,
                     "match_finished",
                     player_num=player_num,
-                    score=score,
+                    score=computed_score,
                 )
-                print(f">>> [TOURNAMENT] Match finished — Player {player_num} score: {score}")
+                print(f">>> [TOURNAMENT] Match finished — Player {player_num} score: {computed_score:.2f}")
+
+            # Duel mode: submit score to room, then poll for winner
+            if IS_MULTIPLAYER and not TOURNAMENT_MODE and CURRENT_ROOM_CODE and uid:
+                if result_thread:
+                    result_thread.join(timeout=15)
+                _submit_duel_result(CURRENT_ROOM_CODE, uid, PLAYER_NUM, computed_score)
+                print(f">>> [DUEL] Score submitted — Player {PLAYER_NUM} score: {computed_score:.2f}")
+
+            # Notify WS that game is over
+            if IS_MULTIPLAYER and _ws_client and _ws_client.connected:
+                _ws_client.send({
+                    "type":         "GAME_OVER",
+                    "player_id":    f"P{PLAYER_NUM}",
+                    "player_name":  nick_name,
+                    "player_num":   PLAYER_NUM,
+                    "game_score":   sum(1 for t in times if t > 0),
+                })
 
         except Exception as e:
             print(f">>> [API] Error saving participant: {e}")
@@ -1819,11 +2640,15 @@ class TimeIn(customtkinter.CTk):
 
     def _build_results_dashboard(self, age_real, age_cog, visuo_spatial):
         """Show a celebratory results card with scores and per-level breakdown."""
+        self._duel_result_label = None
+        self._duel_p1_score_label = None
+        self._duel_p2_score_label = None
         # Hide game elements, show results
         self.design_frame_0.grid_remove()
         self.design_frame_1.grid_remove()
         self.level_badge_frame.grid_remove()
         self.star_frame.grid_remove()
+        self._exit_btn.place_forget()
         self.results_frame.grid()
 
         # Clear previous results
@@ -1840,21 +2665,50 @@ class TimeIn(customtkinter.CTk):
         line = customtkinter.CTkFrame(self.results_frame, fg_color=_CLR_ACCENT, height=3, corner_radius=0)
         line.grid(row=1, column=0, sticky="ew", padx=20, pady=(0, 16))
 
-        # Main score card — Modern: rounded, accent border, dark fill
+        # Main score card with stars
         trophy = customtkinter.CTkFrame(
             self.results_frame, fg_color=_CLR_BG, corner_radius=_CORNER_RADIUS,
-            border_width=2, border_color=_CLR_ACCENT,
+            border_width=2, border_color=_CLR_GOLD,
         )
         trophy.grid(row=2, column=0, sticky="ew", padx=20, pady=(0, 16))
         trophy.grid_columnconfigure(0, weight=1)
+
+        # Star rating based on visuo_spatial
+        if visuo_spatial >= 90:
+            stars = "⭐⭐⭐⭐⭐"
+            star_label = "LUAR BIASA!"
+        elif visuo_spatial >= 75:
+            stars = "⭐⭐⭐⭐"
+            star_label = "HEBAT!"
+        elif visuo_spatial >= 60:
+            stars = "⭐⭐⭐"
+            star_label = "BAGUS!"
+        elif visuo_spatial >= 40:
+            stars = "⭐⭐"
+            star_label = "LUMAYAN"
+        else:
+            stars = "⭐"
+            star_label = "SEMANGAT!"
+
+        customtkinter.CTkLabel(
+            trophy, text=stars,
+            font=(_FONT_PRIMARY[0], 28), text_color=_CLR_GOLD,
+        ).grid(row=0, column=0, pady=(16, 2))
+
         customtkinter.CTkLabel(
             trophy, text=f"{visuo_spatial}%",
-            font=(_FONT_PRIMARY[0], 44, "bold"), text_color=_CLR_ACCENT,
-        ).grid(row=0, column=0, pady=(18, 2))
+            font=(_FONT_PRIMARY[0], 52, "bold"), text_color=_CLR_GOLD,
+        ).grid(row=1, column=0, pady=(0, 2))
+
+        customtkinter.CTkLabel(
+            trophy, text=star_label,
+            font=(_FONT_PRIMARY[0], 20, "bold"), text_color=_CLR_SUCCESS,
+        ).grid(row=2, column=0, pady=(0, 2))
+
         customtkinter.CTkLabel(
             trophy, text="Kebugaran Visual-Spasial",
             font=(_FONT_PRIMARY[0], 13), text_color=_CLR_MUTED,
-        ).grid(row=1, column=0, pady=(0, 18))
+        ).grid(row=3, column=0, pady=(0, 16))
 
         # Stats row
         stats = customtkinter.CTkFrame(self.results_frame, fg_color="transparent")
@@ -1871,249 +2725,177 @@ class TimeIn(customtkinter.CTk):
         _stat_card(stats, "Usia", f"{age_real} th").grid(row=0, column=0, padx=(0, 8), sticky="ew")
         _stat_card(stats, "Usia Kognitif", f"{age_cog} th").grid(row=0, column=1, padx=(8, 0), sticky="ew")
 
-        # Per-level times
+        # Duel / Tournament result banner
+        if IS_MULTIPLAYER and CURRENT_ROOM_CODE:
+            duel_banner = customtkinter.CTkFrame(self.results_frame, fg_color=_CLR_CARD, corner_radius=_CORNER_RADIUS, border_width=2, border_color=_CLR_ACCENT)
+            duel_banner.grid(row=4, column=0, sticky="ew", padx=20, pady=(8, 8))
+            duel_banner.grid_columnconfigure(0, weight=1)
+
+            # Finish order indicator
+            if _opponent_finished:
+                finish_text = "⚖️ Lawan selesai lebih dulu!"
+                finish_color = "#f59e0b"
+            else:
+                finish_text = "⚡ Kamu selesai duluan!"
+                finish_color = "#22c55e"
+            customtkinter.CTkLabel(
+                duel_banner, text=finish_text,
+                font=(_FONT_PRIMARY[0], 12, "bold"), text_color=finish_color,
+            ).grid(row=0, column=0, pady=(14, 4))
+
+            if not TOURNAMENT_MODE:
+                duel_label = customtkinter.CTkLabel(
+                    duel_banner, text="Menunggu hasil lawan...",
+                    font=(_FONT_PRIMARY[0], 18, "bold"), text_color=_CLR_ACCENT,
+                )
+                duel_label.grid(row=1, column=0, pady=(4, 8))
+
+                # Score comparison row
+                duel_scores = customtkinter.CTkFrame(duel_banner, fg_color="transparent")
+                duel_scores.grid(row=2, column=0, sticky="ew", padx=16, pady=(0, 4))
+                duel_scores.grid_columnconfigure((0, 1), weight=1)
+                p1_score_label = customtkinter.CTkLabel(duel_scores, text="P1: --", font=(_FONT_PRIMARY[0], 13, "bold"), text_color=_CLR_TEXT)
+                p1_score_label.grid(row=0, column=0, sticky="w")
+                p2_score_label = customtkinter.CTkLabel(duel_scores, text="P2: --", font=(_FONT_PRIMARY[0], 13, "bold"), text_color=_CLR_TEXT)
+                p2_score_label.grid(row=0, column=1, sticky="e")
+
+                # Store references so WS match_result can update them
+                self._duel_result_label = duel_label
+                self._duel_p1_score_label = p1_score_label
+                self._duel_p2_score_label = p2_score_label
+
+                def _on_duel_result(decided, data):
+                    try:
+                        if decided and data.get("winner"):
+                            w = data["winner"]
+                            my_num = str(PLAYER_NUM)
+                            p1s = f"P1: {data.get('player1_score', '--')}"
+                            p2s = f"P2: {data.get('player2_score', '--')}"
+                            p1_score_label.configure(text=p1s)
+                            p2_score_label.configure(text=p2s)
+                            if w == "draw":
+                                duel_label.configure(text="SERI!", text_color=_CLR_ACCENT)
+                            elif w == my_num:
+                                duel_label.configure(text="🏆 KAMU MENANG!", text_color="#22c55e")
+                            else:
+                                duel_label.configure(text="KAMU KALAH", text_color="#ef4444")
+                        else:
+                            duel_label.configure(text="Hasil tidak tersedia", text_color=_CLR_MUTED)
+                    except Exception:
+                        pass
+                _poll_duel_result(CURRENT_ROOM_CODE, callback=_on_duel_result)
+            else:
+                # Tournament mode — show match finished status
+                customtkinter.CTkLabel(
+                    duel_banner, text=" matchup selesai — lihat bracket untuk hasil",
+                    font=(_FONT_PRIMARY[0], 14, "bold"), text_color=_CLR_TEXT,
+                ).grid(row=1, column=0, pady=(4, 14))
+                self._duel_result_label = None
+                self._duel_p1_score_label = None
+                self._duel_p2_score_label = None
+
+        # Per-level times with color-coded progress bars
         if self.timer_task_all:
             customtkinter.CTkLabel(
                 self.results_frame, text="Waktu per Level",
-                font=(_FONT_PRIMARY[0], 13, "bold"), text_color=_CLR_MUTED,
-            ).grid(row=4, column=0, pady=(12, 6))
-            times_frame = customtkinter.CTkFrame(self.results_frame, fg_color="transparent")
-            times_frame.grid(row=5, column=0, sticky="ew", padx=20, pady=(0, 12))
-            cols = min(len(self.timer_task_all), 4)
-            for i in range(cols):
-                times_frame.grid_columnconfigure(i, weight=1)
+                font=(_FONT_PRIMARY[0], 14, "bold"), text_color=_CLR_TEXT,
+            ).grid(row=5, column=0, pady=(16, 6), sticky="w", padx=20)
+
             for i, t in enumerate(self.timer_task_all):
-                r, c = divmod(i, cols)
+                bar_color = _CLR_LEVEL_DONE if t < 15 else (_CLR_WARNING if t < 25 else _CLR_DANGER)
+                level_row = customtkinter.CTkFrame(self.results_frame, fg_color="transparent")
+                level_row.grid(row=6 + i, column=0, sticky="ew", padx=20, pady=2)
+                level_row.grid_columnconfigure(1, weight=1)
+
                 customtkinter.CTkLabel(
-                    times_frame, text=f"L{i+1}: {t:.1f}s",
-                    font=(_FONT_PRIMARY[0], 12), text_color=_CLR_TEXT,
-                ).grid(row=r, column=c, pady=3)
+                    level_row, text=f"L{i+1}", font=(_FONT_PRIMARY[0], 12, "bold"),
+                    text_color=_CLR_MUTED, width=28,
+                ).grid(row=0, column=0, padx=(0, 6))
+
+                # Progress bar background
+                bar_bg = customtkinter.CTkFrame(level_row, fg_color=_CLR_CARD, corner_radius=3, height=20)
+                bar_bg.grid(row=0, column=1, sticky="ew")
+
+                # Progress bar fill (relative to max ~60s)
+                max_time = 60.0
+                fill_pct = min(t / max_time, 1.0)
+                bar_fill = customtkinter.CTkFrame(bar_bg, fg_color=bar_color, corner_radius=3, height=20)
+                bar_fill.place(relx=0, rely=0, relwidth=fill_pct, relheight=1.0)
+
+                customtkinter.CTkLabel(
+                    level_row, text=f"{t:.1f}s", font=(_FONT_PRIMARY[0], 12, "bold"),
+                    text_color=_CLR_TEXT, width=50,
+                ).grid(row=0, column=2, padx=(6, 0))
 
         # Buttons
         btn_frame = customtkinter.CTkFrame(self.results_frame, fg_color="transparent")
-        btn_frame.grid(row=6, column=0, sticky="ew", padx=20, pady=(10, 20))
+        btn_frame.grid(row=7 + len(self.timer_task_all) if self.timer_task_all else 7, column=0, sticky="ew", padx=20, pady=(16, 8))
         btn_frame.grid_columnconfigure(0, weight=1)
         btn_frame.grid_columnconfigure(1, weight=1)
+        btn_frame.grid_columnconfigure(2, weight=1)
 
         customtkinter.CTkButton(
             btn_frame, text="Main Lagi",
             font=(_FONT_PRIMARY[0], 14, "bold"),
             fg_color=_CLR_ACCENT, hover_color=_CLR_ACCENT2,
-            text_color=_CLR_TEXT, corner_radius=_CORNER_RADIUS, height=56,
+            text_color=_CLR_TEXT, corner_radius=_CORNER_RADIUS, height=52,
             command=self.retry_test,
-        ).grid(row=0, column=0, padx=(0, 8), sticky="ew")
+        ).grid(row=0, column=0, padx=(0, 4), sticky="ew")
         customtkinter.CTkButton(
             btn_frame, text="Salin Hasil",
             font=(_FONT_PRIMARY[0], 14, "bold"),
             fg_color=_CLR_CARD, hover_color=_CLR_SUBTLE_BORDER,
-            text_color=_CLR_TEXT, corner_radius=_CORNER_RADIUS, height=56,
-        ).grid(row=0, column=1, padx=(8, 0), sticky="ew")
+            text_color=_CLR_TEXT, corner_radius=_CORNER_RADIUS, height=52,
+            command=lambda: self._copy_results(visuo_spatial, age_real, age_cog),
+        ).grid(row=0, column=1, padx=4, sticky="ew")
+        customtkinter.CTkButton(
+            btn_frame, text="✕ Ganti Peserta",
+            font=(_FONT_PRIMARY[0], 14, "bold"),
+            fg_color=_CLR_DANGER, hover_color=_CLR_DANGER_HOVER,
+            text_color=_CLR_TEXT, corner_radius=_CORNER_RADIUS, height=52,
+            command=self._switch_player,
+        ).grid(row=0, column=2, padx=(4, 0), sticky="ew")
+
+    def _copy_results(self, visuo_spatial, age_real, age_cog):
+        """Copy results to clipboard."""
+        level_reached = sum(1 for t in self.timer_task_all if t > 0) if self.timer_task_all else 0
+        text = f"BDT Result | VS: {visuo_spatial}% | Usia: {age_real} | Kognitif: {age_cog} | Level: {level_reached}/{MAX_LEVEL}"
+        if self.timer_task_all:
+            text += " | " + " ".join(f"L{i+1}:{t:.1f}s" for i, t in enumerate(self.timer_task_all))
+        self.clipboard_clear()
+        self.clipboard_append(text)
+        print(f">>> Results copied to clipboard")
     
     def skip_current_level(self, event=None):
-        """Skip the current level when Enter key is pressed"""
+        """Surrender the current level — record 0.0 score, no cognitive age contribution."""
         if not hasattr(self, 'current_question') or not hasattr(self, 'timer_running') or not self.timer_running:
             return
-            
-        current_time = time.time()
-        time_elapsed = round((current_time - self.start_task), 2)
-        
-        print(f"Skipping level {self.current_question} after {time_elapsed} seconds")
-        
-        # Record the actual time taken for the level
-        if self.current_question == 1 and self.task_flag_01:
-            self.timer_task_01 = time_elapsed
-            self.timer_task_all.append(self.timer_task_01)
-            self.cognitive_age_list.append(self.estimate_cognitive_age(self.timer_task_01))
-            self.task_flag_01 = False
-            print(f"TASK 1 SKIPPED after {self.timer_task_01} seconds")
-            if int(self.timer_task_01) < 10:
-                play_audio("AUDIO/menakjubkan.wav")
-            elif int(self.timer_task_01) < 15:
-                play_audio("AUDIO/hebat_sekali.wav")
-            elif int(self.timer_task_01) < 20:
-                play_audio("AUDIO/mantap.wav")
-            elif int(self.timer_task_01) < 25:
-                play_audio("AUDIO/kerja_bagus.wav")
-            elif int(self.timer_task_01) < 30:
-                play_audio("AUDIO/ayo_semangat.wav")
-            else:
-                play_audio("AUDIO/jangan_menyerah.wav")
-            if self.max_level != 1:
-                play_audio("AUDIO/lanjut_lvl2.wav")
-            self.current_question = 2
-            
-        elif self.current_question == 2 and self.task_flag_02:
-            self.timer_task_02 = time_elapsed
-            self.timer_task_all.append(self.timer_task_02)
-            self.cognitive_age_list.append(self.estimate_cognitive_age(self.timer_task_02))
-            self.task_flag_02 = False
-            print(f"TASK 2 SKIPPED after {self.timer_task_02} seconds")
-            if int(self.timer_task_02) < 10:
-                play_audio("AUDIO/menakjubkan.wav")
-            elif int(self.timer_task_02) < 15:
-                play_audio("AUDIO/hebat_sekali.wav")
-            elif int(self.timer_task_02) < 20:
-                play_audio("AUDIO/mantap.wav")
-            elif int(self.timer_task_02) < 25:
-                play_audio("AUDIO/kerja_bagus.wav")
-            elif int(self.timer_task_02) < 30:
-                play_audio("AUDIO/ayo_semangat.wav")
-            else:
-                play_audio("AUDIO/jangan_menyerah.wav")
-            if self.max_level != 2:
-                play_audio("AUDIO/lanjut_lvl3.wav")
-            self.current_question = 3
-            
-        # Add more levels as needed (up to 8)
-        elif self.current_question == 3 and self.task_flag_03:
-            self.timer_task_03 = time_elapsed
-            self.timer_task_all.append(self.timer_task_03)
-            self.cognitive_age_list.append(self.estimate_cognitive_age(self.timer_task_03))
-            self.task_flag_03 = False
-            print(f"TASK 3 SKIPPED after {self.timer_task_03} seconds")
-            if int(self.timer_task_03) < 10:
-                play_audio("AUDIO/menakjubkan.wav")
-            elif int(self.timer_task_03) < 15:
-                play_audio("AUDIO/hebat_sekali.wav")
-            elif int(self.timer_task_03) < 20:
-                play_audio("AUDIO/mantap.wav")
-            elif int(self.timer_task_03) < 25:
-                play_audio("AUDIO/kerja_bagus.wav")
-            elif int(self.timer_task_03) < 30:
-                play_audio("AUDIO/ayo_semangat.wav")
-            else:
-                play_audio("AUDIO/jangan_menyerah.wav")
-            if self.max_level != 3:
-                play_audio("AUDIO/lanjut_lvl4.wav")
-            self.current_question = 4
-            
-        elif self.current_question == 4 and self.task_flag_04:
-            self.timer_task_04 = time_elapsed
-            self.timer_task_all.append(self.timer_task_04)
-            self.cognitive_age_list.append(self.estimate_cognitive_age(self.timer_task_04))
-            self.task_flag_04 = False
-            print(f"TASK 4 SKIPPED after {self.timer_task_04} seconds")
-            if int(self.timer_task_04) < 10:
-                play_audio("AUDIO/menakjubkan.wav")
-            elif int(self.timer_task_04) < 15:
-                play_audio("AUDIO/hebat_sekali.wav")
-            elif int(self.timer_task_04) < 20:
-                play_audio("AUDIO/mantap.wav")
-            elif int(self.timer_task_04) < 25:
-                play_audio("AUDIO/kerja_bagus.wav")
-            elif int(self.timer_task_04) < 30:
-                play_audio("AUDIO/ayo_semangat.wav")
-            else:
-                play_audio("AUDIO/jangan_menyerah.wav")
-            if self.max_level != 4:
-                play_audio("AUDIO/lanjut_lvl5.wav")
-            self.current_question = 5
-            
-        elif self.current_question == 5 and self.task_flag_05:
-            self.timer_task_05 = time_elapsed
-            self.timer_task_all.append(self.timer_task_05)
-            self.cognitive_age_list.append(self.estimate_cognitive_age(self.timer_task_05))
-            self.task_flag_05 = False
-            print(f"TASK 5 SKIPPED after {self.timer_task_05} seconds")
-            if int(self.timer_task_05) < 10:
-                play_audio("AUDIO/menakjubkan.wav")
-            elif int(self.timer_task_05) < 15:
-                play_audio("AUDIO/hebat_sekali.wav")
-            elif int(self.timer_task_05) < 20:
-                play_audio("AUDIO/mantap.wav")
-            elif int(self.timer_task_05) < 25:
-                play_audio("AUDIO/kerja_bagus.wav")
-            elif int(self.timer_task_05) < 30:
-                play_audio("AUDIO/ayo_semangat.wav")
-            else:
-                play_audio("AUDIO/jangan_menyerah.wav")
-            if self.max_level != 5:
-                play_audio("AUDIO/lanjut_lvl6.wav")
-            self.current_question = 6
-            
-        elif self.current_question == 6 and self.task_flag_06:
-            self.timer_task_06 = time_elapsed
-            self.timer_task_all.append(self.timer_task_06)
-            self.cognitive_age_list.append(self.estimate_cognitive_age(self.timer_task_06))
-            self.task_flag_06 = False
-            print(f"TASK 6 SKIPPED after {self.timer_task_06} seconds")
-            if int(self.timer_task_06) < 10:
-                play_audio("AUDIO/menakjubkan.wav")
-            elif int(self.timer_task_06) < 15:
-                play_audio("AUDIO/hebat_sekali.wav")
-            elif int(self.timer_task_06) < 20:
-                play_audio("AUDIO/mantap.wav")
-            elif int(self.timer_task_06) < 25:
-                play_audio("AUDIO/kerja_bagus.wav")
-            elif int(self.timer_task_06) < 30:
-                play_audio("AUDIO/ayo_semangat.wav")
-            else:
-                play_audio("AUDIO/jangan_menyerah.wav")
-            if self.max_level != 6:
-                play_audio("AUDIO/lanjut_lvl7.wav")
-            self.current_question = 7
-            
-        elif self.current_question == 7 and self.task_flag_07:
-            self.timer_task_07 = time_elapsed
-            self.timer_task_all.append(self.timer_task_07)
-            self.cognitive_age_list.append(self.estimate_cognitive_age(self.timer_task_07))
-            self.task_flag_07 = False
-            print(f"TASK 7 SKIPPED after {self.timer_task_07} seconds")
-            if int(self.timer_task_07) < 10:
-                play_audio("AUDIO/menakjubkan.wav")
-            elif int(self.timer_task_07) < 15:
-                play_audio("AUDIO/hebat_sekali.wav")
-            elif int(self.timer_task_07) < 20:
-                play_audio("AUDIO/mantap.wav")
-            elif int(self.timer_task_07) < 25:
-                play_audio("AUDIO/kerja_bagus.wav")
-            elif int(self.timer_task_07) < 30:
-                play_audio("AUDIO/ayo_semangat.wav")
-            else:
-                play_audio("AUDIO/jangan_menyerah.wav")
-            if self.max_level != 7:
-                play_audio("AUDIO/lanjut_lvl8.wav")
-            self.current_question = 8
-            
-        elif self.current_question == 8 and self.task_flag_08:
-            self.timer_task_08 = time_elapsed
-            self.timer_task_all.append(self.timer_task_08)
-            self.cognitive_age_list.append(self.estimate_cognitive_age(self.timer_task_08))
-            self.task_flag_08 = False
-            print(f"TASK 8 SKIPPED after {self.timer_task_08} seconds")
-            if int(self.timer_task_08) < 10:
-                play_audio("AUDIO/menakjubkan.wav")
-            elif int(self.timer_task_08) < 15:
-                play_audio("AUDIO/hebat_sekali.wav")
-            elif int(self.timer_task_08) < 20:
-                play_audio("AUDIO/mantap.wav")
-            elif int(self.timer_task_08) < 25:
-                play_audio("AUDIO/kerja_bagus.wav")
-            elif int(self.timer_task_08) < 30:
-                play_audio("AUDIO/ayo_semangat.wav")
-            else:
-                play_audio("AUDIO/jangan_menyerah.wav")
-            self.current_question = 9
-            # No need to change current_question as this is the last level
-        
-        # Report completed level to API
-        _done_level = len(self.timer_task_all)
-        _done_time  = self.timer_task_all[-1] if self.timer_task_all else 0.0
-        self._api_event("level_complete", level=_done_level, time_sec=_done_time)
 
-        # Mark badge completed
+        lvl = self.current_question
+        flag_attr = f"task_flag_{lvl:02d}"
+        task_attr = f"timer_task_{lvl:02d}"
+
+        if not hasattr(self, flag_attr) or not getattr(self, flag_attr):
+            return
+
+        print(f">>> Level {lvl} SURRENDERED (skipped)")
+        play_sfx('skip')
+
+        setattr(self, task_attr, 0.0)
+        self.timer_task_all.append(0.0)
+        setattr(self, flag_attr, False)
+        self.current_question = lvl + 1
+
+        _done_level = len(self.timer_task_all)
+        self._api_event("level_complete", level=_done_level, time_sec=0.0)
         self._update_level_badge(_done_level, state="completed")
 
-        # Update the display for the next level if not the last level
         if 1 <= self.current_question <= self.max_level:
             variant = self.get_random_variant(self.current_question)
             self.current_variant = variant
-
-            # Load image with button mode support
             self.load_level_image(variant)
             self.current_level_button.grid_remove()
             self.show_current_level_button(self.current_question)
-            # Reset the start time for the next level
             self.start_task = time.time()
             self._api_event("level_start", level=self.current_question)
             self.reset_timer()
@@ -2145,13 +2927,11 @@ class TimeIn(customtkinter.CTk):
 
     def _start_game(self):
         """Actual game start after countdown."""
-        # Load and resize the initial image
         variant = self.get_random_variant(self.current_question)
         self.current_variant = variant
-        
-        # Use helper method to load image with button mode support
+
         self.load_level_image(variant)
-        
+
         self._start_heartbeat()
         self.start_task = time.time()
         self._api_event("level_start", level=1)
@@ -2160,22 +2940,28 @@ class TimeIn(customtkinter.CTk):
         if TOURNAMENT_MODE and CURRENT_ROOM_CODE:
             _send_tournament_event(CURRENT_ROOM_CODE, "match_started")
 
+        # In competition mode, send player_ready via WS for synchronized start
+        if IS_MULTIPLAYER and _ws_client and _ws_client.connected:
+            _ws_client.send({"type": "player_ready", "player_id": f"P{PLAYER_NUM}", "player_name": nick_name, "player_num": PLAYER_NUM})
+
         self.streaming()
 
-        # Reset and start the timer
         self.reset_timer()
         self.start_timer()
 
     def button_0_callback(self):
-        # Hide the start button
         self.button_0.grid_remove()
-        # Show the current level button in the same position
         self.show_current_level_button(self.current_question)
-        
-        play_audio("AUDIO/hitung_mundur.wav")
+
+        play_sfx('countdown')
         print("START")
-        
-        self._show_countdown(count=3, on_done=self._start_game)
+
+        if IS_MULTIPLAYER:
+            # In competition: show local countdown, send player_ready
+            # The backend will broadcast match_start to both players
+            self._show_countdown(count=3, on_done=self._start_game)
+        else:
+            self._show_countdown(count=3, on_done=self._start_game)
 
     #def button_1_callback(self):
 
@@ -2208,33 +2994,39 @@ class TimeIn(customtkinter.CTk):
 
         new_x_time = np.array([time_avg]).reshape(-1, 1)
         new_x_time_poly = poly_features.transform(new_x_time)
-        cognitive_age = model_time.predict(new_x_time_poly)
+        cognitive_age = model_time.predict(new_x_time_poly)[0]
 
-        #print(cognitive_age)
-
-        if (cognitive_age < 20):
+        if cognitive_age < 20:
             cognitive_age = 20
-        elif (cognitive_age > 85):
+        elif cognitive_age > 85:
             cognitive_age = 90
         
-        cognitive_age = int(cognitive_age)
-
-        return cognitive_age #.tolist()[0]
+        return int(cognitive_age)
 
         #print("Estimated Cognitive Age : " + str(round(cognitive_age[0], 1)) + " years")
 
     def _update_level_badge(self, level, state="active"):
-        """Update progress badges: completed = gold, active = red, upcoming = gray."""
+        """Update progress badges: completed = gold ✓, active = red, upcoming = muted."""
         for i, badge in enumerate(self.level_badges):
             if i + 1 < level:
-                badge.configure(fg_color=_CLR_SUCCESS, text_color=_CLR_TEXT)
+                badge.configure(text="✓", fg_color=_CLR_LEVEL_DONE, text_color=_CLR_TEXT)
             elif i + 1 == level:
                 if state == "active":
-                    badge.configure(fg_color=_CLR_ACCENT, text_color=_CLR_TEXT)
+                    badge.configure(text=str(i + 1), fg_color=_CLR_LEVEL_ACTIVE, text_color=_CLR_TEXT)
                 else:
-                    badge.configure(fg_color=_CLR_SUCCESS, text_color=_CLR_TEXT)
+                    badge.configure(text="✓", fg_color=_CLR_LEVEL_DONE, text_color=_CLR_TEXT)
             else:
-                badge.configure(fg_color=_CLR_CARD, text_color=_CLR_MUTED)
+                badge.configure(text=str(i + 1), fg_color=_CLR_CARD, text_color=_CLR_MUTED)
+
+    def _show_celebration(self, text="HEBAT!", duration=1200):
+        """Flash a celebration overlay on the design area."""
+        self.celebration_label.configure(text=text)
+        self.celebration_overlay.place(relx=0, rely=0, relwidth=1, relheight=1)
+        self.celebration_overlay.lift()
+        self.after(duration, self._hide_celebration)
+
+    def _hide_celebration(self):
+        self.celebration_overlay.place_forget()
 
     def _update_stars(self, level):
         """Update star progress: completed = gold , active = orange , upcoming = gray """
@@ -2248,13 +3040,13 @@ class TimeIn(customtkinter.CTk):
         self.level_text.configure(text=f"LEVEL {level} / {MAX_LEVEL}")
 
     def show_current_level_button(self, level):
-        self.current_level_button = customtkinter.CTkButton(
+        self.current_level_button = customtkinter.CTkLabel(
             self.top_container,
             text=f"Level {level}",
-            font=(_FONT_PRIMARY[0], 28),
+            font=(_FONT_PRIMARY[0], 28, "bold"),
             fg_color=_CLR_ACCENT,
-            hover_color=_CLR_ACCENT2,
             text_color=_CLR_TEXT,
+            corner_radius=_CORNER_RADIUS,
         )
         
         self.current_level_button.grid(row=1, column=0, columnspan=2, padx=20, pady=10, sticky="ew")
@@ -2265,9 +3057,37 @@ class TimeIn(customtkinter.CTk):
         self._update_stars(level)
     
     def retry_test(self):
+        """Replay with the same player — skip App_Input, go straight to game."""
         self.destroy()
 
-        global IS_MULTIPLAYER, CURRENT_ROOM_CODE, PLAYER_NUM, current_participant_uid, nick_name, gender_code, age_range_code, TOURNAMENT_MODE
+        global _ws_client, _opponent_level, _opponent_blocks, _opponent_finished, _opponent_name
+        _opponent_level = 0
+        _opponent_blocks = 0
+        _opponent_finished = False
+        _opponent_name = ''
+        if _ws_client:
+            _ws_client.close()
+            _ws_client = None
+
+        if PC_MODE == "competition":
+            global IS_MULTIPLAYER, CURRENT_ROOM_CODE, PLAYER_NUM
+            IS_MULTIPLAYER = True
+            app_room = App_Room()
+            app_room.mainloop()
+            if not app_room.room_ready:
+                return
+            CURRENT_ROOM_CODE = app_room.room_code
+            PLAYER_NUM        = app_room.player_num
+
+        app = TimeIn()
+        app.after(0, lambda: app.attributes('-zoomed', True) if sys.platform == 'linux' else app.state('zoomed'))
+        app.mainloop()
+
+    def _switch_player(self):
+        """Go back to App_Input to register a new participant."""
+        self.destroy()
+
+        global IS_MULTIPLAYER, CURRENT_ROOM_CODE, PLAYER_NUM, current_participant_uid, nick_name, gender_code, age_range_code, TOURNAMENT_MODE, TOURNAMENT_ROOM_CODE, TOURNAMENT_OPPONENT, TOURNAMENT_IS_P1, TOURNAMENT_ROUND, _ws_client, _opponent_level, _opponent_blocks, _opponent_finished, _opponent_name
         IS_MULTIPLAYER    = False
         CURRENT_ROOM_CODE = ''
         PLAYER_NUM         = 0
@@ -2276,8 +3096,20 @@ class TimeIn(customtkinter.CTk):
         gender_code = ""
         age_range_code = 0
         TOURNAMENT_MODE = False
+        TOURNAMENT_ROOM_CODE = ''
+        TOURNAMENT_OPPONENT = ''
+        TOURNAMENT_IS_P1 = False
+        TOURNAMENT_ROUND = 0
+        _opponent_level = 0
+        _opponent_blocks = 0
+        _opponent_finished = False
+        _opponent_name = ''
+        if _ws_client:
+            _ws_client.close()
+            _ws_client = None
 
         app_input = App_Input()
+        app_input._start_camera_preview()
         app_input.mainloop()
         if not nick_name:
             return
@@ -2292,7 +3124,7 @@ class TimeIn(customtkinter.CTk):
             PLAYER_NUM        = app_room.player_num
 
         app = TimeIn()
-        app.after(0, lambda: app.state('zoomed'))
+        app.after(0, lambda: app.attributes('-zoomed', True) if sys.platform == 'linux' else app.state('zoomed'))
         app.mainloop()
 
     def update_timer(self):
@@ -2303,7 +3135,7 @@ class TimeIn(customtkinter.CTk):
             self.timer_label.configure(text=f"{minutes:02d}:{seconds:02d}")
             # Danger bar: 0-40s teal, 40-60s orange, 60s+ red
             if elapsed < 40:
-                self.danger_bar.configure(progress_color=_CLR_TEAL)
+                self.danger_bar.configure(progress_color=_CLR_TEAL_SAFE)
             elif elapsed < 60:
                 self.danger_bar.configure(progress_color=_CLR_ACCENT)
             else:
@@ -2324,7 +3156,7 @@ class TimeIn(customtkinter.CTk):
         self.timer_label.configure(text="00:00")
         self.timer_running = False
         self.danger_bar.set(0.0)
-        self.danger_bar.configure(progress_color=_CLR_TEAL)
+        self.danger_bar.configure(progress_color=_CLR_TEAL_SAFE)
 
     def load_level_image(self, variant):
         """Load level image with button mode support"""
@@ -2388,11 +3220,20 @@ class TimeIn(customtkinter.CTk):
 
         self.button_0._state = "disabled"
 
+        if cap is None or not cap.isOpened():
+            print(">>> Camera not available, retrying...")
+            self.after(500, self.streaming)
+            return
+
         ret, frame = cap.read()
         if not ret:
-            print("Failed to read frame from camera")
+            self._camera_fail_count = getattr(self, '_camera_fail_count', 0) + 1
+            if self._camera_fail_count > 50:
+                print(">>> Camera disconnected after multiple retries")
+                return
             self.after(100, self.streaming)
             return
+        self._camera_fail_count = 0
             
         frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
@@ -2433,14 +3274,14 @@ class TimeIn(customtkinter.CTk):
                     # Use numpy copy which is faster than frame.copy()
                     frame_for_yolo = np.array(frame, copy=True)
                     self.yolo_thread.frame_queue.put_nowait(frame_for_yolo)
-                except:
+                except queue.Full:
                     pass  # Queue full, skip this frame
         
         # Get latest detection results if available (non-blocking)
         if not self.yolo_thread.result_queue.empty():
             try:
                 self.latest_detections = self.yolo_thread.result_queue.get_nowait()
-            except:
+            except queue.Empty:
                 pass
         
         # Use latest detections (may be from previous frame, but that's OK)
@@ -2635,22 +3476,22 @@ class TimeIn(customtkinter.CTk):
                         self._api_event("level_complete", level=1, time_sec=self.timer_task_01)
 
                         if int(self.timer_task_01) < 10:
-                            play_audio("AUDIO/menakjubkan.wav")
+                            play_sfx('amazing')
                         elif int(self.timer_task_01) < 15:
-                            play_audio("AUDIO/hebat_sekali.wav")
+                            play_sfx('great')
                         elif int(self.timer_task_01) < 20:
-                            play_audio("AUDIO/mantap.wav")
+                            play_sfx('solid')
                         elif int(self.timer_task_01) < 25:
-                            play_audio("AUDIO/kerja_bagus.wav")
+                            play_sfx('good')
                         elif int(self.timer_task_01) < 30:
-                            play_audio("AUDIO/ayo_semangat.wav")
+                            play_sfx('keep_going')
                         else:
-                            play_audio("AUDIO/jangan_menyerah.wav")
+                            play_sfx('dont_give_up')
 
                         if self.max_level == 1:
                             self.end_test()
                         else:
-                            play_audio("AUDIO/lanjut_lvl2.wav")
+                            play_sfx('next_level')
 
                             self.current_question = 2
                             variant = self.get_random_variant(self.current_question)
@@ -2686,22 +3527,22 @@ class TimeIn(customtkinter.CTk):
                         self._api_event("level_complete", level=2, time_sec=self.timer_task_02)
 
                         if int(self.timer_task_02) < 10:
-                            play_audio("AUDIO/menakjubkan.wav")
+                            play_sfx('amazing')
                         elif int(self.timer_task_02) < 15:
-                            play_audio("AUDIO/hebat_sekali.wav")
+                            play_sfx('great')
                         elif int(self.timer_task_02) < 20:
-                            play_audio("AUDIO/mantap.wav")
+                            play_sfx('solid')
                         elif int(self.timer_task_02) < 25:
-                            play_audio("AUDIO/kerja_bagus.wav")
+                            play_sfx('good')
                         elif int(self.timer_task_02) < 30:
-                            play_audio("AUDIO/ayo_semangat.wav")
+                            play_sfx('keep_going')
                         else:
-                            play_audio("AUDIO/jangan_menyerah.wav")
+                            play_sfx('dont_give_up')
 
                         if self.max_level == 2:
                             self.end_test()
                         else:
-                            play_audio("AUDIO/lanjut_lvl3.wav")
+                            play_sfx('next_level')
 
                             self.current_question = 3
                             variant = self.get_random_variant(self.current_question)
@@ -2737,22 +3578,22 @@ class TimeIn(customtkinter.CTk):
                         self._api_event("level_complete", level=3, time_sec=self.timer_task_03)
 
                         if int(self.timer_task_03) < 10:
-                            play_audio("AUDIO/menakjubkan.wav")
+                            play_sfx('amazing')
                         elif int(self.timer_task_03) < 15:
-                            play_audio("AUDIO/hebat_sekali.wav")
+                            play_sfx('great')
                         elif int(self.timer_task_03) < 20:
-                            play_audio("AUDIO/mantap.wav")
+                            play_sfx('solid')
                         elif int(self.timer_task_03) < 25:
-                            play_audio("AUDIO/kerja_bagus.wav")
+                            play_sfx('good')
                         elif int(self.timer_task_03) < 30:
-                            play_audio("AUDIO/ayo_semangat.wav")
+                            play_sfx('keep_going')
                         else:
-                            play_audio("AUDIO/jangan_menyerah.wav")
+                            play_sfx('dont_give_up')
 
                         if self.max_level == 3:
                             self.end_test()
                         else:
-                            play_audio("AUDIO/lanjut_lvl4.wav")
+                            play_sfx('next_level')
 
                             self.current_question = 4
                             variant = self.get_random_variant(self.current_question)
@@ -2788,22 +3629,22 @@ class TimeIn(customtkinter.CTk):
                         self._api_event("level_complete", level=4, time_sec=self.timer_task_04)
 
                         if int(self.timer_task_04) < 10:
-                            play_audio("AUDIO/menakjubkan.wav")
+                            play_sfx('amazing')
                         elif int(self.timer_task_04) < 15:
-                            play_audio("AUDIO/hebat_sekali.wav")
+                            play_sfx('great')
                         elif int(self.timer_task_04) < 20:
-                            play_audio("AUDIO/mantap.wav")
+                            play_sfx('solid')
                         elif int(self.timer_task_04) < 25:
-                            play_audio("AUDIO/kerja_bagus.wav")
+                            play_sfx('good')
                         elif int(self.timer_task_04) < 30:
-                            play_audio("AUDIO/ayo_semangat.wav")
+                            play_sfx('keep_going')
                         else:
-                            play_audio("AUDIO/jangan_menyerah.wav")
+                            play_sfx('dont_give_up')
 
                         if self.max_level == 4:
                             self.end_test()
                         else:
-                            play_audio("AUDIO/lanjut_lvl5.wav")
+                            play_sfx('next_level')
 
                             self.current_question = 5
                             variant = self.get_random_variant(self.current_question)
@@ -2840,22 +3681,22 @@ class TimeIn(customtkinter.CTk):
                         self._api_event("level_complete", level=5, time_sec=self.timer_task_05)
 
                         if int(self.timer_task_05) < 10:
-                            play_audio("AUDIO/menakjubkan.wav")
+                            play_sfx('amazing')
                         elif int(self.timer_task_05) < 15:
-                            play_audio("AUDIO/hebat_sekali.wav")
+                            play_sfx('great')
                         elif int(self.timer_task_05) < 20:
-                            play_audio("AUDIO/mantap.wav")
+                            play_sfx('solid')
                         elif int(self.timer_task_05) < 25:
-                            play_audio("AUDIO/kerja_bagus.wav")
+                            play_sfx('good')
                         elif int(self.timer_task_05) < 30:
-                            play_audio("AUDIO/ayo_semangat.wav")
+                            play_sfx('keep_going')
                         else:
-                            play_audio("AUDIO/jangan_menyerah.wav")
+                            play_sfx('dont_give_up')
 
                         if self.max_level == 5:
                             self.end_test()
                         else:
-                            play_audio("AUDIO/lanjut_lvl6.wav")
+                            play_sfx('next_level')
 
                             self.current_question = 6
                             variant = self.get_random_variant(self.current_question)
@@ -2892,22 +3733,22 @@ class TimeIn(customtkinter.CTk):
                         self._api_event("level_complete", level=6, time_sec=self.timer_task_06)
 
                         if int(self.timer_task_06) < 10:
-                            play_audio("AUDIO/menakjubkan.wav")
+                            play_sfx('amazing')
                         elif int(self.timer_task_06) < 15:
-                            play_audio("AUDIO/hebat_sekali.wav")
+                            play_sfx('great')
                         elif int(self.timer_task_06) < 20:
-                            play_audio("AUDIO/mantap.wav")
+                            play_sfx('solid')
                         elif int(self.timer_task_06) < 25:
-                            play_audio("AUDIO/kerja_bagus.wav")
+                            play_sfx('good')
                         elif int(self.timer_task_06) < 30:
-                            play_audio("AUDIO/ayo_semangat.wav")
+                            play_sfx('keep_going')
                         else:
-                            play_audio("AUDIO/jangan_menyerah.wav")
+                            play_sfx('dont_give_up')
 
                         if self.max_level == 6:
                             self.end_test()
                         else:
-                            play_audio("AUDIO/lanjut_lvl7.wav")
+                            play_sfx('next_level')
 
                             self.current_question = 7
                             variant = self.get_random_variant(self.current_question)
@@ -2943,22 +3784,22 @@ class TimeIn(customtkinter.CTk):
                         self._api_event("level_complete", level=7, time_sec=self.timer_task_07)
 
                         if int(self.timer_task_07) < 10:
-                            play_audio("AUDIO/menakjubkan.wav")
+                            play_sfx('amazing')
                         elif int(self.timer_task_07) < 15:
-                            play_audio("AUDIO/hebat_sekali.wav")
+                            play_sfx('great')
                         elif int(self.timer_task_07) < 20:
-                            play_audio("AUDIO/mantap.wav")
+                            play_sfx('solid')
                         elif int(self.timer_task_07) < 25:
-                            play_audio("AUDIO/kerja_bagus.wav")
+                            play_sfx('good')
                         elif int(self.timer_task_07) < 30:
-                            play_audio("AUDIO/ayo_semangat.wav")
+                            play_sfx('keep_going')
                         else:
-                            play_audio("AUDIO/jangan_menyerah.wav")
+                            play_sfx('dont_give_up')
 
                         if self.max_level == 7:
                             self.end_test()
                         else:
-                            play_audio("AUDIO/lanjut_lvl8.wav")
+                            play_sfx('next_level')
 
                             self.current_question = 8
                             variant = self.get_random_variant(self.current_question)
@@ -2994,17 +3835,17 @@ class TimeIn(customtkinter.CTk):
                         self._api_event("level_complete", level=8, time_sec=self.timer_task_08)
 
                         if int(self.timer_task_08) < 10:
-                            play_audio("AUDIO/menakjubkan.wav")
+                            play_sfx('amazing')
                         elif int(self.timer_task_08) < 15:
-                            play_audio("AUDIO/hebat_sekali.wav")
+                            play_sfx('great')
                         elif int(self.timer_task_08) < 20:
-                            play_audio("AUDIO/mantap.wav")
+                            play_sfx('solid')
                         elif int(self.timer_task_08) < 25:
-                            play_audio("AUDIO/kerja_bagus.wav")
+                            play_sfx('good')
                         elif int(self.timer_task_08) < 30:
-                            play_audio("AUDIO/ayo_semangat.wav")
+                            play_sfx('keep_going')
                         else:
-                            play_audio("AUDIO/jangan_menyerah.wav")
+                            play_sfx('dont_give_up')
 
                         self.task_flag_08 = False
                         self.end_test()
@@ -3092,6 +3933,16 @@ class TimeIn(customtkinter.CTk):
         """Override destroy to cleanup resources"""
         self.cleanup()
         super().destroy()
+
+    def _on_close(self):
+        """Handle window X button — cleanup and exit."""
+        self._stop_heartbeat()
+        global _ws_client
+        if _ws_client:
+            _ws_client.close()
+            _ws_client = None
+        self.cleanup()
+        self.destroy()
 
     def _open_camera_settings(self):
         """Open camera settings dialog"""
@@ -3244,6 +4095,7 @@ class CameraSettingsDialog(customtkinter.CTkToplevel):
         btn_frame.grid(row=5, column=0, sticky="ew")
         btn_frame.grid_columnconfigure(0, weight=1)
         btn_frame.grid_columnconfigure(1, weight=1)
+        btn_frame.grid_columnconfigure(2, weight=1)
 
         customtkinter.CTkButton(
             btn_frame, text="Batal",
@@ -3255,13 +4107,22 @@ class CameraSettingsDialog(customtkinter.CTkToplevel):
         ).grid(row=0, column=0, padx=(0, 8), sticky="ew")
 
         customtkinter.CTkButton(
+            btn_frame, text="Terapkan",
+            command=self._apply,
+            font=(_FONT_PRIMARY[0], 13, "bold"),
+            fg_color=_CLR_CARD, hover_color=_CLR_SUBTLE_BORDER,
+            text_color=_CLR_TEXT,
+            corner_radius=_CORNER_RADIUS, height=48,
+        ).grid(row=0, column=1, padx=4, sticky="ew")
+
+        customtkinter.CTkButton(
             btn_frame, text="Simpan",
             command=self._save,
             font=(_FONT_PRIMARY[0], 13, "bold"),
             fg_color=_CLR_ACCENT, hover_color=_CLR_ACCENT2,
             text_color=_CLR_TEXT,
             corner_radius=_CORNER_RADIUS, height=48,
-        ).grid(row=0, column=1, sticky="ew")
+        ).grid(row=0, column=2, sticky="ew")
 
         self.protocol("WM_DELETE_WINDOW", self._close)
 
@@ -3309,11 +4170,14 @@ class CameraSettingsDialog(customtkinter.CTkToplevel):
         self.zoom_slider.set(value)
         self._on_zoom_change(value)
 
-    def _save(self):
+    def _apply(self):
         mirror_x = self.mirror_x_var.get()
         mirror_y = self.mirror_y_var.get()
         zoom = round(self.zoom_slider.get(), 1)
         self.master._update_camera_settings(mirror_x, mirror_y, zoom)
+
+    def _save(self):
+        self._apply()
         self._close()
 
     def _close(self):
@@ -3345,6 +4209,7 @@ class App_Room(customtkinter.CTk):
         self.room_ready = False
         self._polling   = False
         self._i_am_ready = False
+        self._ws = None  # GameWebSocket connection
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self._build_ui()
@@ -3357,21 +4222,29 @@ class App_Room(customtkinter.CTk):
 
     def _build_ui(self):
         # Header with refined accent bottom border
-        header = customtkinter.CTkFrame(self, fg_color=_CLR_CARD, corner_radius=0, height=68, border_width=0)
+        header = customtkinter.CTkFrame(self, fg_color=_CLR_CARD, corner_radius=0, height=64, border_width=0)
         header.grid(row=0, column=0, sticky="ew")
         header.grid_propagate(False)
         header.grid_columnconfigure(0, weight=1)
         header.grid_columnconfigure(1, weight=0)
+        header.grid_columnconfigure(2, weight=0)
         customtkinter.CTkLabel(
             header, text="Multiplayer Lobby",
-            font=(_FONT_PRIMARY[0], 24, "bold"), text_color=_CLR_TEXT,
-        ).grid(row=0, column=0, padx=24, pady=18, sticky="w")
+            font=(_FONT_PRIMARY[0], 22, "bold"), text_color=_CLR_TEXT,
+        ).grid(row=0, column=0, padx=20, sticky="w")
+        customtkinter.CTkButton(
+            header, text="✕ Keluar",
+            font=(_FONT_PRIMARY[0], 12, "bold"), width=100, height=36,
+            fg_color=_CLR_DANGER, hover_color=_CLR_DANGER_HOVER,
+            text_color=_CLR_TEXT, corner_radius=_CORNER_RADIUS,
+            command=self._back_to_input,
+        ).grid(row=0, column=1, padx=(0, 8))
         self.conn_pill = customtkinter.CTkLabel(
             header, text="ONLINE",
             font=(_FONT_PRIMARY[0], 10, "bold"), text_color=_CLR_TEXT,
             fg_color=_CLR_SUCCESS, corner_radius=_CORNER_RADIUS_PILL, width=64, height=24,
         )
-        self.conn_pill.grid(row=0, column=1, padx=(0, 24), pady=18, sticky="e")
+        self.conn_pill.grid(row=0, column=2, padx=(0, 20))
 
         # Refined accent line below header
         line = customtkinter.CTkFrame(self, fg_color=_CLR_ACCENT, height=3, corner_radius=0)
@@ -3388,10 +4261,10 @@ class App_Room(customtkinter.CTk):
         customtkinter.CTkButton(
             self.find_frame, text="Buat Room Baru",
             command=self._create_room,
-            font=(_FONT_PRIMARY[0], 15, "bold"),
+            font=(_FONT_PRIMARY[0], 14, "bold"),
             fg_color=_CLR_ACCENT, hover_color=_CLR_ACCENT2,
             text_color=_CLR_TEXT,
-            corner_radius=_CORNER_RADIUS, height=56,
+            corner_radius=_CORNER_RADIUS, height=52,
         ).grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 14))
 
         customtkinter.CTkLabel(
@@ -3416,7 +4289,7 @@ class App_Room(customtkinter.CTk):
             font=(_FONT_PRIMARY[0], 12, "bold"),
             fg_color=_CLR_CARD, hover_color=_CLR_ACCENT,
             text_color=_CLR_TEXT,
-            corner_radius=_CORNER_RADIUS, height=48, width=90,
+            corner_radius=_CORNER_RADIUS, height=40, width=90,
         ).grid(row=0, column=1)
 
         list_header = customtkinter.CTkFrame(self.find_frame, fg_color="transparent")
@@ -3469,7 +4342,7 @@ class App_Room(customtkinter.CTk):
             font=(_FONT_PRIMARY[0], 11, "bold"),
             fg_color=_CLR_SUBTLE_BORDER, hover_color=_CLR_ACCENT,
             text_color=_CLR_TEXT,
-            corner_radius=_CORNER_RADIUS_SMALL, height=34, width=110,
+            corner_radius=_CORNER_RADIUS_SMALL, height=32, width=100,
         ).grid(row=2, column=0, pady=(0, 16))
 
         players_row = customtkinter.CTkFrame(self.lobby_frame, fg_color="transparent")
@@ -3511,25 +4384,26 @@ class App_Room(customtkinter.CTk):
         btn_row = customtkinter.CTkFrame(self.lobby_frame, fg_color="transparent")
         btn_row.grid(row=3, column=0, sticky="ew")
         btn_row.grid_columnconfigure(0, weight=1)
+        btn_row.grid_columnconfigure(1, weight=1)
 
         self.ready_btn = customtkinter.CTkButton(
             btn_row, text="SIAP",
             command=self._mark_ready,
-            font=(_FONT_PRIMARY[0], 18, "bold"),
+            font=(_FONT_PRIMARY[0], 16, "bold"),
             fg_color=_CLR_CARD, hover_color=_CLR_ACCENT,
             text_color=_CLR_TEXT,
-            corner_radius=_CORNER_RADIUS, height=58,
+            corner_radius=_CORNER_RADIUS, height=52,
         )
-        self.ready_btn.grid(row=0, column=0, padx=(0, 10), sticky="ew")
+        self.ready_btn.grid(row=0, column=0, padx=(0, 8), sticky="ew")
 
         customtkinter.CTkButton(
-            btn_row, text="Keluar",
+            btn_row, text="Keluar Room",
             command=self._leave_room,
-            font=(_FONT_PRIMARY[0], 12, "bold"),
+            font=(_FONT_PRIMARY[0], 14, "bold"),
             fg_color=_CLR_DANGER, hover_color=_CLR_DANGER_HOVER,
             text_color=_CLR_TEXT,
-            corner_radius=_CORNER_RADIUS, height=58, width=110,
-        ).grid(row=0, column=1)
+            corner_radius=_CORNER_RADIUS, height=52,
+        ).grid(row=0, column=1, padx=(8, 0), sticky="ew")
 
     # ── Panel switching ───────────────────────────────────────────────────────
 
@@ -3636,6 +4510,7 @@ class App_Room(customtkinter.CTk):
     def _on_joined(self, room: dict):
         self.room_code  = room["id"]
         self.player_num = 1 if room.get("player1_name") == nick_name else 2
+        self._connect_ws()
         self._show_lobby(room)
 
     # ── Lobby actions ─────────────────────────────────────────────────────────
@@ -3675,6 +4550,25 @@ class App_Room(customtkinter.CTk):
         threading.Thread(target=_do, daemon=True).start()
         self._show_find()
         self._refresh_rooms()
+
+    def _back_to_input(self):
+        """Go back to App_Input to change participant."""
+        if self.room_code:
+            import requests as _r
+            code = self.room_code
+            def _do():
+                try:
+                    _r.post(f"{API_SERVER_URL}/api/rooms/{code}/leave", json={"player_name": nick_name}, timeout=5)
+                except Exception:
+                    pass
+            threading.Thread(target=_do, daemon=True).start()
+        self._stop_polling()
+        global _ws_client
+        if _ws_client:
+            _ws_client.close()
+            _ws_client = None
+        self.room_ready = False
+        self.destroy()
 
     def _copy_code(self):
         if self.room_code:
@@ -3773,8 +4667,62 @@ class App_Room(customtkinter.CTk):
         self.room_ready = True
         self.destroy()
 
+    # ── WebSocket integration ─────────────────────────────────────────────────
+
+    def _connect_ws(self):
+        if not API_SERVER_URL or not self.room_code:
+            return
+        global _ws_client
+        _ws_client = GameWebSocket(
+            room_code=self.room_code,
+            player_num=self.player_num,
+            player_name=nick_name,
+            on_message=self._on_ws_message,
+        )
+        _ws_client.connect()
+
+    def _on_ws_message(self, data: dict):
+        try:
+            self.after(0, lambda d=data: self._handle_ws(d))
+        except Exception:
+            pass
+
+    def _handle_ws(self, data: dict):
+        msg_type = data.get("type", "")
+        if msg_type == "room_update":
+            room = {
+                "id":             data.get("room_id", ""),
+                "status":         data.get("status", ""),
+                "player1_name":   data.get("player1_name", ""),
+                "player2_name":   data.get("player2_name", ""),
+                "player1_ready":  False,
+                "player2_ready":  False,
+            }
+            status = room["status"]
+            if status == "ready":
+                room["player1_ready"] = True
+            elif status == "playing":
+                room["player1_ready"] = True
+                room["player2_ready"] = True
+            self._update_lobby(room)
+            if status == "playing":
+                self._on_game_start()
+
+        elif msg_type == "match_start":
+            self._on_game_start()
+
+        elif msg_type == "join":
+            pass  # lobby refresh handled by room_update
+
+        elif msg_type == "leave":
+            pass
+
     def _on_close(self):
         self._stop_polling()
+        global _ws_client
+        if _ws_client:
+            _ws_client.close()
+            _ws_client = None
         if self.room_code:
             import requests as _r
             try:
@@ -3810,7 +4758,7 @@ if __name__ == "__main__":
 
         # Training or after room: launch TimeIn
         app = TimeIn()
-        app.after(0, lambda: app.state('zoomed'))
+        app.after(0, lambda: app.attributes('-zoomed', True) if sys.platform == 'linux' else app.state('zoomed'))
         app.mainloop()
     except SystemExit:
         raise
