@@ -273,24 +273,36 @@ def _check_tournament_match(uid: str, callback=None):
 
 
 def _send_tournament_event(room_code: str, event_type: str, player_num: int = 0, score: float = 0):
-    """POST /api/tournaments/event — match_started / match_finished."""
+    """POST /api/tournaments/event — match_started / match_finished. Retries 3x with local backup."""
     if not API_SERVER_URL:
         return
     def _do():
-        try:
-            import requests as _r
-            payload = {
-                "room_id":     room_code,
-                "event_type":  event_type,
-            }
-            if player_num > 0:
-                payload["player_num"] = player_num
-            if score > 0:
-                payload["score"] = score
-            resp = _r.post(f"{API_SERVER_URL}/api/tournaments/event", json=payload, timeout=5)
-            print(f">>> [TOURNAMENT] Event '{event_type}' sent — status {resp.status_code}")
-        except Exception as e:
-            print(f">>> [TOURNAMENT] Event '{event_type}' failed: {e}")
+        import requests as _r
+        payload = {
+            "room_id":     room_code,
+            "event_type":  event_type,
+        }
+        if player_num > 0:
+            payload["player_num"] = player_num
+        if score > 0:
+            payload["score"] = score
+        ok = False
+        for attempt in range(3):
+            try:
+                resp = _r.post(f"{API_SERVER_URL}/api/tournaments/event", json=payload, timeout=5)
+                if 200 <= resp.status_code < 300:
+                    print(f">>> [TOURNAMENT] Event '{event_type}' sent — status {resp.status_code}")
+                    ok = True
+                    break
+                else:
+                    print(f">>> [TOURNAMENT] Event '{event_type}' failed — status {resp.status_code} (attempt {attempt+1}/3)")
+            except Exception as e:
+                print(f">>> [TOURNAMENT] Event '{event_type}' error: {e} (attempt {attempt+1}/3)")
+            if attempt < 2:
+                time.sleep(1 + attempt)
+        if not ok:
+            print(f">>> [TOURNAMENT] Event '{event_type}' FAILED after 3 retries — saving locally")
+            _save_local_backup(f"tournament_{event_type}_{room_code}_{int(time.time())}.json", payload)
     threading.Thread(target=_do, daemon=True).start()
 
 
@@ -2575,7 +2587,7 @@ class TimeIn(customtkinter.CTk):
 
             payload = {
                 "uid":           uid,
-                "mode":          PC_MODE,
+                "mode":          "tournament" if TOURNAMENT_MODE else PC_MODE,
                 "nick_name":     name,
                 "gender":        gender,
                 "age":           real_age,
