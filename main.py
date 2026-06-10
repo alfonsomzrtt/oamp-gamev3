@@ -198,11 +198,13 @@ def _save_local_backup(filename: str, payload: dict):
 
 
 def _fire_event(payload: dict):
-    """POST /api/game/event with retry in background thread."""
+    """POST /api/game/event with retry in background thread. Saves local backup on failure."""
     if not API_SERVER_URL:
         return
     def _do():
-        _api_post(f"{API_SERVER_URL}/api/game/event", payload, timeout=5)
+        ok = _api_post(f"{API_SERVER_URL}/api/game/event", payload, timeout=5)
+        if not ok:
+            _save_local_backup(f"event_{payload.get('type','unknown')}_{int(time.time())}.json", payload)
     threading.Thread(target=_do, daemon=True).start()
 
 
@@ -307,26 +309,21 @@ def _send_tournament_event(room_code: str, event_type: str, player_num: int = 0,
 
 
 def _submit_duel_result(room_code: str, player_uid: str, player_num: int, score: float):
-    """POST /api/rooms/{code}/result — submit duel score, server determines winner when both submit."""
+    """POST /api/rooms/{code}/result — submit duel score, server determines winner when both submit. Retries 3x with local backup."""
     if not API_SERVER_URL:
         return
     def _do():
-        try:
-            import requests as _r
-            payload = {
-                "player_uid": player_uid,
-                "player_num": player_num,
-                "score":      score,
-            }
-            resp = _r.post(f"{API_SERVER_URL}/api/rooms/{room_code}/result", json=payload, timeout=5)
-            if 200 <= resp.status_code < 300:
-                data = resp.json()
-                match_status = data.get("match_status", "")
-                print(f">>> [DUEL] Result submitted — match_status: {match_status}")
-            else:
-                print(f">>> [DUEL] Submit failed — status {resp.status_code}: {resp.text}")
-        except Exception as e:
-            print(f">>> [DUEL] Submit failed: {e}")
+        payload = {
+            "player_uid": player_uid,
+            "player_num": player_num,
+            "score":      score,
+        }
+        ok = _api_post(f"{API_SERVER_URL}/api/rooms/{room_code}/result", payload, timeout=5)
+        if ok:
+            print(f">>> [DUEL] Result submitted for room: {room_code}")
+        else:
+            print(f">>> [DUEL] Submit FAILED after {_MAX_RETRIES} retries — saving locally")
+            _save_local_backup(f"duel_{room_code}_{player_uid}_{int(time.time())}.json", payload)
     threading.Thread(target=_do, daemon=True).start()
 
 
