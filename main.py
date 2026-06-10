@@ -1109,10 +1109,22 @@ class App_Input(customtkinter.CTk): #CTkToplevel
             return r
 
         # ── UID Section ──────────────────────────────────────────────────────
+        uid_hdr = customtkinter.CTkFrame(self._scroll, fg_color="transparent")
+        uid_hdr.grid(row=next_row(), column=0, sticky="ew", padx=sx, pady=(16, 6))
+        uid_hdr.grid_columnconfigure(0, weight=1)
+
         customtkinter.CTkLabel(
-            self._scroll, text="NOMOR PESERTA",
+            uid_hdr, text="NOMOR PESERTA",
             font=(_FONT_PRIMARY[0], 11, "bold"), text_color=_CLR_MUTED,
-        ).grid(row=next_row(), column=0, sticky="w", padx=sx, pady=(16, 6))
+        ).grid(row=0, column=0, sticky="w")
+
+        self.qr_indicator = customtkinter.CTkLabel(
+            uid_hdr, text="QR",
+            font=(_FONT_PRIMARY[0], 10, "bold"),
+            text_color=_CLR_MUTED, fg_color="transparent",
+            corner_radius=_CORNER_RADIUS_SMALL,
+        )
+        self.qr_indicator.grid(row=0, column=1, sticky="e", padx=(8, 0))
 
         self.textbox_frame_uid = MyTextboxFrame(self._scroll, "UID", values=" ")
         self.textbox_frame_uid.grid(row=next_row(), column=0, sticky="ew", padx=sx, pady=(0, 8))
@@ -1366,6 +1378,24 @@ class App_Input(customtkinter.CTk): #CTkToplevel
         else:
             self._uid_required = True
 
+        # ── QR Code detection via camera preview ──────────────────────────
+        self._qr_detector = None
+        self._qr_available = False
+        try:
+            import cv2 as _cv2
+            if hasattr(_cv2, 'QRCodeDetector'):
+                self._qr_detector = _cv2.QRCodeDetector()
+                self._qr_available = True
+                print(">>> [QR] QRCodeDetector initialized (OpenCV)")
+            else:
+                print(">>> [QR] QRCodeDetector not available (OpenCV >= 4.5 required)")
+                self.qr_indicator.configure(text="✗QR", text_color=_CLR_MUTED)
+        except Exception as e:
+            print(f">>> [QR] Failed to init QR detector: {e}")
+            self.qr_indicator.configure(text="✗QR", text_color=_CLR_MUTED)
+        self._qr_last_detected_ts = 0.0
+        self._qr_cooldown = 3.0  # seconds between detections
+
     def _on_close(self):
         self._preview_running = False
         raise SystemExit(0)
@@ -1513,6 +1543,7 @@ class App_Input(customtkinter.CTk): #CTkToplevel
     def _preview_loop(self):
         import cv2 as _cv2
         pw, ph = 400, 280
+        _qframe = 0
         while self._preview_running:
             try:
                 if cap is None or not cap.isOpened():
@@ -1522,6 +1553,19 @@ class App_Input(customtkinter.CTk): #CTkToplevel
                 if not ret or frame is None:
                     time.sleep(0.05)
                     continue
+
+                # ── QR Code detection (every 5 frames, BGR) ──────────────
+                _qframe += 1
+                if self._qr_available and _qframe % 5 == 0 \
+                        and (time.time() - self._qr_last_detected_ts) > self._qr_cooldown:
+                    try:
+                        data, _, _ = self._qr_detector.detectAndDecode(frame)
+                        if data and data.strip():
+                            self._qr_last_detected_ts = time.time()
+                            uid = data.strip()
+                            self.after(0, lambda u=uid: self._on_qr_detected(u))
+                    except Exception:
+                        pass  # QR detection failure is non-critical
 
                 frame = _cv2.cvtColor(frame, _cv2.COLOR_BGR2RGB)
                 if CAMERA_MIRROR_X:
@@ -1548,6 +1592,30 @@ class App_Input(customtkinter.CTk): #CTkToplevel
             except Exception:
                 pass
             time.sleep(0.03)
+
+    # ── QR Code auto-fill ─────────────────────────────────────────────────
+    def _on_qr_detected(self, uid):
+        """QR code detected in camera preview — auto-fill UID field."""
+        current_uid = self.textbox_frame_uid.get().strip()
+        if current_uid == uid:
+            return  # already filled with this UID
+
+        print(f">>> [QR] Detected UID: {uid}")
+        self.textbox_frame_uid.set_text(uid)
+        self.uid_status.configure(
+            text=f"◉ QR terdeteksi: {uid} — tekan Enter untuk cek",
+            text_color=_CLR_ACCENT,
+        )
+        self.qr_indicator.configure(
+            text="✓ QR",
+            text_color=_CLR_SUCCESS,
+            fg_color=_CLR_SUCCESS + "20",
+        )
+        self.after(2500, lambda: self.qr_indicator.configure(
+            text="QR",
+            text_color=_CLR_MUTED,
+            fg_color="transparent",
+        ))
 
     def report_callback_exception(self, exc, val, tb):
         log_exception("Tk callback exception (App_Input)", exc, val, tb)
@@ -1582,6 +1650,7 @@ class App_Input(customtkinter.CTk): #CTkToplevel
         self.cek_uid_btn.configure(state="normal", text="CEK")
         self.reset_btn.configure(state="normal")
         self.info_box.grid_remove()
+        self._qr_last_detected_ts = 0.0  # allow QR re-scan
 
         if PC_MODE == "training":
             self.uid_status.configure(text="Mode Latihan — UID opsional", text_color=_CLR_MUTED)
@@ -1733,10 +1802,12 @@ try:
         print(">>> PC_MODE=training — App_Input optional, using placeholder data")
         app_input = App_Input()
         app_input._start_camera_preview()
+        app_input.after(0, lambda: app_input.attributes('-zoomed', True) if sys.platform == 'linux' else app_input.state('zoomed'))
         app_input.mainloop()
     else:
         app_input = App_Input()
         app_input._start_camera_preview()
+        app_input.after(0, lambda: app_input.attributes('-zoomed', True) if sys.platform == 'linux' else app_input.state('zoomed'))
         app_input.mainloop()
 except Exception:
     print(">>> Failed while running input window. Full traceback:")
@@ -2285,6 +2356,7 @@ class TimeIn(customtkinter.CTk):
         self.current_question = 1
 
         self.cognitive_age_list = []
+        self.variant_played_list = []
 
         global nick_name
         global gender_code
@@ -2599,6 +2671,9 @@ class TimeIn(customtkinter.CTk):
                 "task_avg":      avg_time_all,
                 "cognitive_age": estimated_age,
                 "visuo_spatial": visuo_spatial,
+                "cog_age_list":  self.cognitive_age_list,
+                "variant_list":  self.variant_played_list,
+                "client_ts":     int(time.time()),
             }
 
             if uid:
@@ -3119,6 +3194,7 @@ class TimeIn(customtkinter.CTk):
 
         app_input = App_Input()
         app_input._start_camera_preview()
+        app_input.after(0, lambda: app_input.attributes('-zoomed', True) if sys.platform == 'linux' else app_input.state('zoomed'))
         app_input.mainloop()
         if not nick_name:
             return
@@ -3480,6 +3556,7 @@ class TimeIn(customtkinter.CTk):
                         self.timer_task_all.append(self.timer_task_01)
 
                         self.cognitive_age_list.append(self.estimate_cognitive_age(self.timer_task_01))
+                        self.variant_played_list.append(self.current_variant)
 
                         print ("TASK 1 COMPLETED in " + str(self.timer_task_01) +" seconds")
                         self._api_event("level_complete", level=1, time_sec=self.timer_task_01)
@@ -3531,6 +3608,7 @@ class TimeIn(customtkinter.CTk):
                         self.timer_task_all.append(self.timer_task_02)
 
                         self.cognitive_age_list.append(self.estimate_cognitive_age(self.timer_task_02))
+                        self.variant_played_list.append(self.current_variant)
 
                         print ("TASK 2 COMPLETED in " + str(self.timer_task_02) +" seconds")
                         self._api_event("level_complete", level=2, time_sec=self.timer_task_02)
@@ -3582,6 +3660,7 @@ class TimeIn(customtkinter.CTk):
                         self.timer_task_all.append(self.timer_task_03)
 
                         self.cognitive_age_list.append(self.estimate_cognitive_age(self.timer_task_03))
+                        self.variant_played_list.append(self.current_variant)
 
                         print ("TASK 3 COMPLETED in " + str(self.timer_task_03) +" seconds")
                         self._api_event("level_complete", level=3, time_sec=self.timer_task_03)
@@ -3633,6 +3712,7 @@ class TimeIn(customtkinter.CTk):
                         self.timer_task_all.append(self.timer_task_04)
 
                         self.cognitive_age_list.append(self.estimate_cognitive_age(self.timer_task_04))
+                        self.variant_played_list.append(self.current_variant)
 
                         print ("TASK 4 COMPLETED in " + str(self.timer_task_04) +" seconds")
                         self._api_event("level_complete", level=4, time_sec=self.timer_task_04)
@@ -3685,6 +3765,7 @@ class TimeIn(customtkinter.CTk):
                         self.timer_task_all.append(self.timer_task_05)
 
                         self.cognitive_age_list.append(self.estimate_cognitive_age(self.timer_task_05))
+                        self.variant_played_list.append(self.current_variant)
 
                         print ("TASK 5 COMPLETED in " + str(self.timer_task_05) +" seconds")
                         self._api_event("level_complete", level=5, time_sec=self.timer_task_05)
@@ -3737,6 +3818,7 @@ class TimeIn(customtkinter.CTk):
                         self.timer_task_all.append(self.timer_task_06)
 
                         self.cognitive_age_list.append(self.estimate_cognitive_age(self.timer_task_06))
+                        self.variant_played_list.append(self.current_variant)
 
                         print ("TASK 6 COMPLETED in " + str(self.timer_task_06) +" seconds")
                         self._api_event("level_complete", level=6, time_sec=self.timer_task_06)
@@ -3788,6 +3870,7 @@ class TimeIn(customtkinter.CTk):
                         self.timer_task_all.append(self.timer_task_07)
 
                         self.cognitive_age_list.append(self.estimate_cognitive_age(self.timer_task_07))
+                        self.variant_played_list.append(self.current_variant)
 
                         print ("TASK 7 COMPLETED in " + str(self.timer_task_07) +" seconds")
                         self._api_event("level_complete", level=7, time_sec=self.timer_task_07)
@@ -3839,6 +3922,7 @@ class TimeIn(customtkinter.CTk):
                         self.timer_task_all.append(self.timer_task_08)
 
                         self.cognitive_age_list.append(self.estimate_cognitive_age(self.timer_task_08))
+                        self.variant_played_list.append(self.current_variant)
 
                         print ("TASK 8 COMPLETED in " + str(self.timer_task_08) +" seconds")
                         self._api_event("level_complete", level=8, time_sec=self.timer_task_08)
