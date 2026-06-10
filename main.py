@@ -1126,6 +1126,13 @@ class App_Input(customtkinter.CTk): #CTkToplevel
         )
         self.qr_indicator.grid(row=0, column=1, sticky="e", padx=(8, 0))
 
+        # QR instruction
+        self.qr_hint = customtkinter.CTkLabel(
+            self._scroll, text="Arahkan QR code bracelet ke kamera preview",
+            font=(_FONT_PRIMARY[0], 10), text_color=_CLR_MUTED,
+        )
+        self.qr_hint.grid(row=next_row(), column=0, sticky="w", padx=sx, pady=(0, 4))
+
         self.textbox_frame_uid = MyTextboxFrame(self._scroll, "UID", values=" ")
         self.textbox_frame_uid.grid(row=next_row(), column=0, sticky="ew", padx=sx, pady=(0, 8))
         self.textbox_frame_uid.bind_return(self._cek_uid)
@@ -1306,7 +1313,7 @@ class App_Input(customtkinter.CTk): #CTkToplevel
         btn_frame.grid_columnconfigure(1, weight=1)
 
         self.detect_btn = customtkinter.CTkButton(
-            btn_frame, text="Deteksi Blok (Tes)",
+            btn_frame, text="Tes Deteksi Blok",
             command=self._test_block_detection,
             font=(_FONT_PRIMARY[0], 13, "bold"),
             fg_color=_CLR_SUCCESS, hover_color=_CLR_SUCCESS_HOVER,
@@ -1497,15 +1504,15 @@ class App_Input(customtkinter.CTk): #CTkToplevel
         try:
             if cap is None or not cap.isOpened():
                 self.after(0, lambda: self.detect_result.configure(
-                    text="Kamera tidak tersedia", text_color=_CLR_DANGER))
-                self.after(0, lambda: self.detect_btn.configure(state="normal", text="Deteksi Blok (Tes)"))
+                    text="✗ Kamera tidak tersedia", text_color=_CLR_DANGER))
+                self.after(0, lambda: self.detect_btn.configure(state="normal", text="Tes Deteksi Blok"))
                 return
 
             ret, frame = cap.read()
             if not ret or frame is None:
                 self.after(0, lambda: self.detect_result.configure(
-                    text="Gagal membaca kamera", text_color=_CLR_DANGER))
-                self.after(0, lambda: self.detect_btn.configure(state="normal", text="Deteksi Blok (Tes)"))
+                    text="✗ Gagal membaca kamera", text_color=_CLR_DANGER))
+                self.after(0, lambda: self.detect_btn.configure(state="normal", text="Tes Deteksi Blok"))
                 return
 
             # Run YOLO detection
@@ -1513,32 +1520,27 @@ class App_Input(customtkinter.CTk): #CTkToplevel
                 from ultralytics import YOLO as _YOLO
                 results = model_yolo(frame, verbose=False)
                 if len(results) > 0 and hasattr(results[0], 'boxes'):
-                    boxes = results[0].boxes
-                    num_blocks = len(boxes)
-                    confs = [f"{box.conf[0].cpu().numpy():.0%}" for box in boxes]
+                    num_blocks = len(results[0].boxes)
                 else:
                     num_blocks = 0
-                    confs = []
             else:
                 results = model_yolo(frame)
                 df = results.pandas().xyxy[0]
                 num_blocks = len(df)
-                confs = [f"{row['confidence']:.0%}" for _, row in df.iterrows()]
 
             if num_blocks > 0:
-                conf_str = ", ".join(confs[:5])
-                msg = f"Terdeteksi {num_blocks} blok — confidence: {conf_str}"
+                msg = "✓ Blok terdeteksi — kamera siap"
                 color = _CLR_SUCCESS
             else:
-                msg = "Tidak ada blok terdeteksi — coba posisikan blok di kamera"
+                msg = "✗ Blok tidak terdeteksi — coba posisikan ulang"
                 color = _CLR_WARNING
 
             self.after(0, lambda: self.detect_result.configure(text=msg, text_color=color))
         except Exception as e:
             self.after(0, lambda: self.detect_result.configure(
-                text=f"Error: {e}", text_color=_CLR_DANGER))
+                text="✗ Deteksi gagal — periksa kamera", text_color=_CLR_DANGER))
         finally:
-            self.after(0, lambda: self.detect_btn.configure(state="normal", text="Deteksi Blok (Tes)"))
+            self.after(0, lambda: self.detect_btn.configure(state="normal", text="Tes Deteksi Blok"))
 
     def _preview_loop(self):
         import cv2 as _cv2
@@ -2440,6 +2442,15 @@ class TimeIn(customtkinter.CTk):
             "level":       level,
             "time_sec":    round(float(time_sec), 3),
         })
+        # Broadcast level_start via WS so opponent knows we started a level
+        if event_type == "level_start" and _ws_client and _ws_client.connected:
+            _ws_client.send({
+                "type":        "level_start",
+                "player_id":   f"P{PLAYER_NUM}",
+                "player_name": nick_name,
+                "player_num":  PLAYER_NUM,
+                "level":       level,
+            })
         # Also broadcast level_complete via WS for live opponent tracking
         if event_type == "level_complete" and _ws_client and _ws_client.connected:
             _ws_client.send({
@@ -2516,6 +2527,13 @@ class TimeIn(customtkinter.CTk):
                 _opponent_name = data.get("player_name", _opponent_name or "Lawan")
                 self._update_opponent_badge()
 
+        elif msg_type == "level_start":
+            opp_num = data.get("player_num", 0)
+            if opp_num != PLAYER_NUM:
+                _opponent_level = data.get("level", _opponent_level)
+                _opponent_name = data.get("player_name", _opponent_name or "Lawan")
+                self._update_opponent_badge()
+
         elif msg_type == "GAME_OVER":
             opp_num = data.get("player_num", 0)
             if opp_num != PLAYER_NUM:
@@ -2542,8 +2560,13 @@ class TimeIn(customtkinter.CTk):
             return
         level_text = f"L{_opponent_level}" if _opponent_level > 0 else "--"
         name = _opponent_name or "Lawan"
-        status = "Selesai!" if _opponent_finished else f"Level {level_text}"
-        color = "#22c55e" if _opponent_finished else _CLR_ACCENT
+        if _opponent_finished:
+            status = f"Selesai!"
+            color = "#22c55e"
+        else:
+            time_part = f" ({_opponent_blocks}s)" if _opponent_blocks > 0 else ""
+            status = f"Level {level_text}{time_part}"
+            color = _CLR_ACCENT
         self._opponent_badge.configure(text=f"{name}: {status}", text_color=color)
 
     def _show_opponent_finished_banner(self):
@@ -2569,8 +2592,8 @@ class TimeIn(customtkinter.CTk):
             return
         my_num = str(PLAYER_NUM)
         try:
-            p1s = f"P1: {p1_score:.1f}" if p1_score else "P1: --"
-            p2s = f"P2: {p2_score:.1f}" if p2_score else "P2: --"
+            p1s = f"P1: {p1_score:.1f}s" if p1_score else "P1: --"
+            p2s = f"P2: {p2_score:.1f}s" if p2_score else "P2: --"
             if hasattr(self, '_duel_p1_score_label') and self._duel_p1_score_label:
                 self._duel_p1_score_label.configure(text=p1s)
             if hasattr(self, '_duel_p2_score_label') and self._duel_p2_score_label:
@@ -2619,6 +2642,20 @@ class TimeIn(customtkinter.CTk):
         self.stop_timer()
         self.current_level_button.grid_remove()
         self.timer_task_avg = format(float(sum(self.timer_task_all) / len(self.timer_task_all)), ".3f")
+
+        is_duel = PC_MODE == "competition" or TOURNAMENT_MODE
+        if is_duel:
+            # Pure speed scoring for duel/competition/tournament
+            age_real = int(self.age_range_code)
+            total_time = float(sum(self.timer_task_all))
+            print("Your name is " + self.nick_name)
+            print("Your gender is " + self.gender_code)
+            print("Your Total Time is " + str(round(total_time, 2)) + " seconds")
+            play_sfx('complete')
+            self._show_celebration("TES SELESAI!", duration=2500)
+            self.after(2500, lambda: self._finish_test(100, None, None, None, age_real, 0))
+            return
+
         cognitive_age_avg = int(sum(self.cognitive_age_list) / len(self.cognitive_age_list))
         age_real = int(self.age_range_code)
         age_cog = cognitive_age_avg
@@ -2682,12 +2719,9 @@ class TimeIn(customtkinter.CTk):
                 _save_training_locally(payload)
                 print(f">>> [LOCAL] Training results saved without UID (uid={uid!r})")
 
-            # Compute standardized score for tournament/duel
-            level_reached = sum(1 for t in times if t > 0)
-            dexterity_score = (float(estimated_age) / float(real_age)) if real_age > 0 and estimated_age > 0 else 0.0
-            if dexterity_score > 2.0:
-                dexterity_score = 2.0
-            computed_score = (level_reached * 10) + (visuo_spatial / 100.0 * 50) + (dexterity_score * 0.2)
+            # Compute score for tournament/duel (pure speed: lower = faster)
+            is_duel = PC_MODE == "competition" or TOURNAMENT_MODE
+            total_time_score = float(sum(t for t in self.timer_task_all))
 
             # Tournament cup: report match finished with score
             if TOURNAMENT_MODE and CURRENT_ROOM_CODE:
@@ -2696,16 +2730,16 @@ class TimeIn(customtkinter.CTk):
                     CURRENT_ROOM_CODE,
                     "match_finished",
                     player_num=player_num,
-                    score=computed_score,
+                    score=total_time_score,
                 )
-                print(f">>> [TOURNAMENT] Match finished — Player {player_num} score: {computed_score:.2f}")
+                print(f">>> [TOURNAMENT] Match finished — Player {player_num} time: {total_time_score:.2f}s")
 
             # Duel mode: submit score to room, then poll for winner
             if IS_MULTIPLAYER and not TOURNAMENT_MODE and CURRENT_ROOM_CODE and uid:
                 if result_thread:
                     result_thread.join(timeout=15)
-                _submit_duel_result(CURRENT_ROOM_CODE, uid, PLAYER_NUM, computed_score)
-                print(f">>> [DUEL] Score submitted — Player {PLAYER_NUM} score: {computed_score:.2f}")
+                _submit_duel_result(CURRENT_ROOM_CODE, uid, PLAYER_NUM, total_time_score)
+                print(f">>> [DUEL] Score submitted — Player {PLAYER_NUM} time: {total_time_score:.2f}s")
 
             # Notify WS that game is over
             if IS_MULTIPLAYER and _ws_client and _ws_client.connected:
