@@ -1262,6 +1262,10 @@ class App_Input(customtkinter.CTk): #CTkToplevel
         self._qr_last_detected_ts = 0.0
         self._qr_cooldown = 3.0  # seconds between detections
 
+        # ── Block detection test (toggle mode) ─────────────────────────
+        self._block_test_active = False
+        self._last_block_detections = []
+
     def _on_close(self):
         self._preview_running = False
         raise SystemExit(0)
@@ -1390,55 +1394,19 @@ class App_Input(customtkinter.CTk): #CTkToplevel
         mb.showinfo("Tersimpan", "Pengaturan kamera disimpan ke .env")
 
     def _test_block_detection(self):
-        self.detect_btn.configure(state="disabled", text="Deteksi...")
-        self.detect_result.configure(text="Menjalankan deteksi blok...", text_color=_CLR_MUTED)
-        threading.Thread(target=self._run_detection_test, daemon=True).start()
-
-    def _run_detection_test(self):
-        try:
-            if cap is None or not cap.isOpened():
-                self.after(0, lambda: self.detect_result.configure(
-                    text="✗ Kamera tidak tersedia", text_color=_CLR_DANGER))
-                self.after(0, lambda: self.detect_btn.configure(state="normal", text="Tes Blok"))
-                return
-
-            ret, frame = cap.read()
-            if not ret or frame is None:
-                self.after(0, lambda: self.detect_result.configure(
-                    text="✗ Gagal membaca kamera", text_color=_CLR_DANGER))
-                self.after(0, lambda: self.detect_btn.configure(state="normal", text="Tes Blok"))
-                return
-
-            # Run YOLO detection
-            if USE_BANTAL_MODEL:
-                from ultralytics import YOLO as _YOLO
-                results = model_yolo(frame, verbose=False)
-                if len(results) > 0 and hasattr(results[0], 'boxes'):
-                    num_blocks = len(results[0].boxes)
-                else:
-                    num_blocks = 0
-            else:
-                results = model_yolo(frame)
-                df = results.pandas().xyxy[0]
-                num_blocks = len(df)
-
-            if num_blocks > 0:
-                msg = "✓ Blok terdeteksi — kamera siap"
-                color = _CLR_SUCCESS
-            else:
-                msg = "✗ Blok tidak terdeteksi — coba posisikan ulang"
-                color = _CLR_WARNING
-
-            self.after(0, lambda: self.detect_result.configure(text=msg, text_color=color))
-        except Exception as e:
-            self.after(0, lambda: self.detect_result.configure(
-                text="✗ Deteksi gagal — periksa kamera", text_color=_CLR_DANGER))
-        finally:
-            self.after(0, lambda: self.detect_btn.configure(state="normal", text="Tes Blok"))
+        self._block_test_active = not self._block_test_active
+        if self._block_test_active:
+            self.detect_btn.configure(text="Stop Tes", fg_color=_CLR_DANGER)
+            self.detect_result.configure(text="Deteksi aktif — blok di-highlight (hijau)", text_color=_CLR_SUCCESS)
+        else:
+            self.detect_btn.configure(text="Tes Blok", fg_color=_CLR_SUCCESS)
+            self.detect_result.configure(text="")
+            self._last_block_detections = []
 
     def _preview_loop(self):
         import cv2 as _cv2
         _qframe = 0
+        _dframe = 0
         while self._preview_running:
             try:
                 if cap is None or not cap.isOpened():
@@ -1482,6 +1450,34 @@ class App_Input(customtkinter.CTk): #CTkToplevel
                         start_x = (new_w - w) // 2
                         start_y = (new_h - h) // 2
                         frame = frame[start_y:start_y + h, start_x:start_x + w]
+
+                # ── Block detection overlay (when test active) ──────────
+                if self._block_test_active:
+                    _dframe += 1
+                    if _dframe % 15 == 0:
+                        try:
+                            if USE_BANTAL_MODEL:
+                                _res = model_yolo(frame, verbose=False)
+                                self._last_block_detections = _res[0].boxes if (len(_res) > 0 and hasattr(_res[0], 'boxes')) else []
+                            else:
+                                _res = model_yolo(frame)
+                                self._last_block_detections = _res.pandas().xyxy[0].values.tolist()
+                        except Exception:
+                            self._last_block_detections = []
+                    _count = 0
+                    if USE_BANTAL_MODEL:
+                        for _b in self._last_block_detections:
+                            _x1, _y1, _x2, _y2 = [int(v) for v in _b.xyxy[0].cpu().numpy()]
+                            if float(_b.conf[0].cpu().numpy()) > 0.7:
+                                _cv2.rectangle(frame, (_x1, _y1), (_x2, _y2), (0, 255, 0), 2)
+                                _count += 1
+                    else:
+                        for _d in self._last_block_detections:
+                            _x1, _y1, _x2, _y2, _conf = int(_d[0]), int(_d[1]), int(_d[2]), int(_d[3]), float(_d[4])
+                            if _conf > 0.7:
+                                _cv2.rectangle(frame, (_x1, _y1), (_x2, _y2), (0, 255, 0), 2)
+                                _count += 1
+                    _cv2.putText(frame, f"Blok: {_count}", (12, 36), _cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 3)
 
                 # Aspect-ratio-preserving letterbox (like TimeIn)
                 h_f, w_f = frame.shape[:2]
