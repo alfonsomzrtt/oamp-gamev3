@@ -45,7 +45,7 @@ Window starts maximized with dark theme. Linux uses `attributes('-zoomed')`, oth
 
 | Var | Values | Default | Effect |
 |-----|--------|---------|--------|
-| `PC_MODE` | `competition` / `training` | `training` | `competition`: UID required, multiplayer lobby. `training`: skip to game |
+| `PC_MODE` | `competition` / `training` | `training` | Initial mode at startup. Can be toggled via UI (Latihan/Kompetisi buttons in title bar) — UI changes override this. |
 | `API_SERVER_URL` | URL or empty | (empty) | Empty = offline solo mode, no server calls |
 | `MODEL_BANTAL` | `true` / `false` | `false` | `true`: `MODEL/bantal/bantal.pt`. `false`: `MODEL/exp7/weights/best.pt` |
 | `NORMAL_PATTERN` | `true` / `false` | `false` | Switches between two `LEVEL_ANSWERS` dicts and `FILES/` subdirectories |
@@ -67,7 +67,7 @@ Window starts maximized with dark theme. Linux uses `attributes('-zoomed')`, oth
 
 ## Architecture
 
-Single-file app: all logic in `main.py` (~4900 lines). No modules or packages.
+Single-file app: all logic in `main.py` (~4800 lines). No modules or packages.
 
 ### Classes
 
@@ -137,12 +137,13 @@ Pressing Enter during a level **surrenders** it — the level is recorded as `0.
 ### Score Formula (shared with backend)
 
 ```
-score = (level_reached × 10) + (visuo_spatial_fit × 50) + (dexterity_score × 0.2)
+score = (level_reached × 1000) - (total_time × 10)
 ```
 
 - `level_reached`: count of levels with `task_time > 0`
-- `visuo_spatial_fit`: `visuo_spatial / 100` (percentage → 0.0-1.0)
-- `dexterity_score`: `cognitive_age / real_age` (capped at 2.0)
+- `total_time`: sum of all task times (task01 + ... + task08)
+- Score capped at minimum 0
+- **Duel winner** determined by pure total_time (lower = faster), not by formula score
 
 ### Result Submission
 
@@ -203,6 +204,11 @@ GUI cannot be unit-tested directly because of the module-level initialization.
 - **Global mutable state** (`nick_name`, `gender_code`, `current_participant_uid`, etc.) shared across classes via `global` statements.
 - **Camera settings** (device, mirror, zoom) configurable in-app via CameraSettingsDialog, persisted to `.env`.
 - **Dark/light theme** controlled by `THEME` env var. Requires restart.
+- **Mode toggle** via [Latihan|Kompetisi] buttons in the title bar — changes `CURRENT_MODE` and updates UID requirement/button state. `PC_MODE` env var only used at startup.
+- **QR auto-CEK** — scanning a QR code automatically triggers `_cek_uid()` without waiting for button press. `_cek_in_progress` flag prevents concurrent calls.
+- **Heartbeat** — periodic HTTP POST to `/api/v1/game/event` (type: `heartbeat`) updates server-side `player_states.updated_at`. Stops on TimeIn.destroy().
+- **WebSocket game events** — `_setup_ws_for_game()` connects to `/ws/match/:room_id`. Sends `level_start`, `score_update` via WS. Handles `level_start`, `score_update`, `GAME_OVER`, `match_result` from opponent.
+- **Cognitive age tracking** — uses `numpy.interp` (replaced sklearn to remove 100MB dependency) on 14 pre-computed data points. Collected in `cognitive_age_list` for analytics only — NOT used in scoring.
 - **`FILES/` assets** loaded by hardcoded filenames at module level — renaming breaks the app.
 - **`DLL/`** directory is Windows-only Intel MKL DLLs; irrelevant on Linux/Mac.
 - **Window close** on all screens properly cleans up YOLO thread, serial thread, WebSocket, and camera resources.

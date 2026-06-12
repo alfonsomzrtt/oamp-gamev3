@@ -23,8 +23,10 @@ def test_game_result_payload_structure():
         "task07": 11.0,
         "task08": 12.0,
         "task_avg": 8.5,
-        "cognitive_age": 9.0,
+        "cognitive_age": 23,
         "visuo_spatial": 85.0,
+        "variant_list": ["1a", "2b", "3c", "4d", "5a", "6b", "7c", "8d"],
+        "client_ts": 1234567890,
     }
     # Serialize/deserialize to catch type issues
     raw = json.dumps(payload)

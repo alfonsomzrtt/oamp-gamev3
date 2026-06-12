@@ -120,9 +120,9 @@ def _save_env_value(key, value):
     with open(env_path, 'w') as f:
         f.writelines(new_lines)
 
-# PC mode: "competition" = duel / tournament mode selection after UID scan
-#          "training" = solo (TimeIn directly), UID optional
-PC_MODE   = os.getenv('PC_MODE', 'competition').lower()
+# Mode: "competition" = duel / tournament | "training" = solo (UID optional)
+# Default from env, can be changed via UI toggle
+CURRENT_MODE = os.getenv('PC_MODE', 'training').lower()
 
 # Get max level from environment variable (default to 8 if not set or invalid)
 try:
@@ -404,14 +404,16 @@ class GameWebSocket:
             try:
                 url = self._build_url()
                 print(f">>> [WS] Connecting to {url}")
-                self._ws = _ws_mod.WebSocketApp(
+                ws = _ws_mod.WebSocketApp(
                     url,
                     on_open=self._on_open,
                     on_message=self._on_msg,
                     on_error=self._on_err,
                     on_close=self._on_close,
                 )
-                self._ws.run_forever(ping_interval=30, ping_timeout=10)
+                with self._lock:
+                    self._ws = ws
+                ws.run_forever(ping_interval=30, ping_timeout=10)
             except Exception as e:
                 print(f">>> [WS] Connection error: {e}")
             if not self._should_reconnect:
@@ -452,11 +454,15 @@ class GameWebSocket:
     def close(self):
         self._should_reconnect = False
         self._connected = False
-        if self._ws:
-            try:
-                self._ws.close()
-            except Exception:
-                pass
+        with self._lock:
+            if self._ws:
+                try:
+                    self._ws.close()
+                except Exception:
+                    pass
+                self._ws = None
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=2)
 
     @property
     def connected(self):
@@ -1083,307 +1089,165 @@ class App_Input(customtkinter.CTk): #CTkToplevel
             font=(_FONT_PRIMARY[0], 12), text_color=_CLR_ACCENT,
         ).grid(row=1, column=0, padx=20, sticky="w")
 
-        # Theme toggle (top-right)
+        # Mode toggle + Theme toggle (right side of title bar)
+        actions_col = customtkinter.CTkFrame(title_bar, fg_color="transparent")
+        actions_col.grid(row=0, column=1, rowspan=2, padx=(0, 16), sticky="e")
+
+        # Mode toggle: Latihan | Kompetisi
+        self._mode_btn_training = customtkinter.CTkButton(
+            actions_col, text="Latihan",
+            command=lambda: self._on_mode_change("training"),
+            font=(_FONT_PRIMARY[0], 11, "bold"),
+            corner_radius=_CORNER_RADIUS_SMALL, height=32, width=72,
+        )
+        self._mode_btn_training.pack(side="left", padx=(0, 2))
+
+        self._mode_btn_competition = customtkinter.CTkButton(
+            actions_col, text="Kompetisi",
+            command=lambda: self._on_mode_change("competition"),
+            font=(_FONT_PRIMARY[0], 11, "bold"),
+            corner_radius=_CORNER_RADIUS_SMALL, height=32, width=80,
+        )
+        self._mode_btn_competition.pack(side="left", padx=(0, 10))
+
+        # Theme toggle
         theme_label = "Light" if _THEME == "dark" else "Dark"
         self.theme_btn = customtkinter.CTkButton(
-            title_bar, text=theme_label,
+            actions_col, text=theme_label,
             command=self._toggle_theme,
             font=(_FONT_PRIMARY[0], 11, "bold"),
             fg_color=_CLR_BG, hover_color=_CLR_SUBTLE_BORDER,
             text_color=_CLR_TEXT,
             corner_radius=_CORNER_RADIUS_PILL, height=32, width=64,
         )
-        self.theme_btn.grid(row=0, column=1, rowspan=2, padx=(0, 16), sticky="e")
+        self.theme_btn.pack(side="left")
 
-        # Scrollable content area
-        self._scroll = customtkinter.CTkScrollableFrame(self, fg_color=_CLR_BG, corner_radius=0)
-        self._scroll.grid(row=1, column=0, sticky="nsew")
-        self._scroll.grid_columnconfigure(0, weight=1)
+        # Content area — fixed layout, camera fills remaining space
+        self._content = customtkinter.CTkFrame(self, fg_color=_CLR_BG, corner_radius=0)
+        self._content.grid(row=1, column=0, sticky="nsew")
+        self._content.grid_columnconfigure(0, weight=1)
+        self._content.grid_rowconfigure(0, weight=0)   # UID
+        self._content.grid_rowconfigure(1, weight=1)   # Camera (fills space)
+        self._content.grid_rowconfigure(2, weight=0)   # Button
 
-        sx = 20  # side padding inside scroll
-        row = [0]  # mutable counter for grid row
-
-        def next_row():
-            r = row[0]
-            row[0] += 1
-            return r
+        sx = 20
 
         # ── UID Section ──────────────────────────────────────────────────────
-        uid_hdr = customtkinter.CTkFrame(self._scroll, fg_color="transparent")
-        uid_hdr.grid(row=next_row(), column=0, sticky="ew", padx=sx, pady=(16, 6))
-        uid_hdr.grid_columnconfigure(0, weight=1)
+        uid_section = customtkinter.CTkFrame(self._content, fg_color=_CLR_CARD, corner_radius=_CORNER_RADIUS, border_width=1, border_color=_CLR_SUBTLE_BORDER)
+        uid_section.grid(row=0, column=0, sticky="ew", padx=sx, pady=(16, 10))
 
-        customtkinter.CTkLabel(
-            uid_hdr, text="NOMOR PESERTA",
-            font=(_FONT_PRIMARY[0], 11, "bold"), text_color=_CLR_MUTED,
-        ).grid(row=0, column=0, sticky="w")
+        uid_top = customtkinter.CTkFrame(uid_section, fg_color="transparent")
+        uid_top.grid(row=0, column=0, sticky="ew", padx=14, pady=(14, 0))
+        uid_top.grid_columnconfigure(1, weight=1)
 
-        self.qr_indicator = customtkinter.CTkLabel(
-            uid_hdr, text="QR",
-            font=(_FONT_PRIMARY[0], 10, "bold"),
-            text_color=_CLR_MUTED, fg_color="transparent",
-            corner_radius=_CORNER_RADIUS_SMALL,
-        )
-        self.qr_indicator.grid(row=0, column=1, sticky="e", padx=(8, 0))
+        customtkinter.CTkLabel(uid_top, text="UID", font=(_FONT_PRIMARY[0], 13, "bold"), text_color=_CLR_ACCENT, width=32).grid(row=0, column=0, padx=(0, 8))
 
-        # QR instruction
-        self.qr_hint = customtkinter.CTkLabel(
-            self._scroll, text="Arahkan QR code bracelet ke kamera preview",
-            font=(_FONT_PRIMARY[0], 10), text_color=_CLR_MUTED,
-        )
-        self.qr_hint.grid(row=next_row(), column=0, sticky="w", padx=sx, pady=(0, 4))
-
-        self.textbox_frame_uid = MyTextboxFrame(self._scroll, "UID", values=" ")
-        self.textbox_frame_uid.grid(row=next_row(), column=0, sticky="ew", padx=sx, pady=(0, 8))
+        self.textbox_frame_uid = MyTextboxFrame(uid_top, "UID", values="")
+        self.textbox_frame_uid.grid(row=0, column=1, sticky="ew", padx=(0, 8))
         self.textbox_frame_uid.bind_return(self._cek_uid)
 
-        self.cek_uid_btn = customtkinter.CTkButton(
-            self._scroll, text="CEK",
-            command=self._cek_uid,
-            font=(_FONT_PRIMARY[0], 14, "bold"),
-            fg_color=_CLR_ACCENT, hover_color=_CLR_ACCENT2,
-            text_color=_CLR_TEXT,
-            corner_radius=_CORNER_RADIUS, height=44,
-        )
-        self.cek_uid_btn.grid(row=next_row(), column=0, sticky="ew", padx=sx, pady=(0, 10))
+        self.cek_uid_btn = customtkinter.CTkButton(uid_top, text="CEK", command=self._cek_uid, font=(_FONT_PRIMARY[0], 13, "bold"), fg_color=_CLR_ACCENT, hover_color=_CLR_ACCENT2, text_color=_CLR_TEXT, corner_radius=_CORNER_RADIUS, height=40, width=64)
+        self.cek_uid_btn.grid(row=0, column=2)
 
-        # -- Participant Info Box --
-        self.info_box = customtkinter.CTkFrame(
-            self._scroll, fg_color=_CLR_CARD, corner_radius=_CORNER_RADIUS,
-            border_width=1, border_color=_CLR_SUBTLE_BORDER,
-        )
-        self.info_box.grid(row=next_row(), column=0, sticky="ew", padx=sx, pady=(0, 0))
+        self.qr_indicator = customtkinter.CTkLabel(uid_top, text="", font=(_FONT_PRIMARY[0], 10, "bold"), text_color=_CLR_MUTED, width=56)
+        self.qr_indicator.grid(row=0, column=3, padx=(8, 0))
+
+        self.uid_status = customtkinter.CTkLabel(uid_section, text="", font=(_FONT_PRIMARY[0], 11), text_color=_CLR_MUTED)
+        self.uid_status.grid(row=1, column=0, padx=16, pady=(4, 0), sticky="w")
+
+        self.info_box = customtkinter.CTkFrame(uid_section, fg_color="transparent")
+        self.info_box.grid(row=2, column=0, sticky="ew", padx=14, pady=(4, 10))
         self.info_box.grid_columnconfigure(0, weight=1)
         self.info_box.grid_remove()
 
-        self.participant_info = customtkinter.CTkLabel(
-            self.info_box, text="Belum ada peserta",
-            font=(_FONT_PRIMARY[0], 13), text_color=_CLR_MUTED,
-        )
-        self.participant_info.grid(row=0, column=0, padx=16, pady=(12, 4), sticky="w")
+        self.participant_info = customtkinter.CTkLabel(self.info_box, text="Belum ada peserta", font=(_FONT_PRIMARY[0], 13), text_color=_CLR_MUTED)
+        self.participant_info.grid(row=0, column=0, sticky="w")
 
-        self.reset_btn = customtkinter.CTkButton(
-            self.info_box, text="Ganti",
-            command=self._reset_scan,
-            font=(_FONT_PRIMARY[0], 11),
-            fg_color="transparent", hover_color=_CLR_SUBTLE_BORDER,
-            text_color=_CLR_MUTED, height=24, width=56,
-            corner_radius=_CORNER_RADIUS_SMALL,
-        )
-        self.reset_btn.grid(row=1, column=0, padx=16, pady=(0, 10), sticky="w")
-
-        self.uid_status = customtkinter.CTkLabel(
-            self._scroll, text="",
-            font=(_FONT_PRIMARY[0], 12), text_color=_CLR_ACCENT,
-        )
-        self.uid_status.grid(row=next_row(), column=0, padx=sx, pady=(6, 0), sticky="w")
+        self.reset_btn = customtkinter.CTkButton(self.info_box, text="Ganti", command=self._reset_scan, font=(_FONT_PRIMARY[0], 11), fg_color="transparent", hover_color=_CLR_SUBTLE_BORDER, text_color=_CLR_MUTED, height=24, width=56, corner_radius=_CORNER_RADIUS_SMALL)
+        self.reset_btn.grid(row=0, column=1, sticky="e")
 
         # ══════════════════════════════════════════════════════════════════════
-        # ── CAMERA SETUP ── Prominent, bordered, always visible ──────────────
+        # ── Camera Preview — fills remaining space ────────────────────────────
         # ══════════════════════════════════════════════════════════════════════
-        cam_card = customtkinter.CTkFrame(
-            self._scroll, fg_color=_CLR_CARD, corner_radius=_CORNER_RADIUS,
-            border_width=2, border_color=_CLR_ACCENT,
-        )
-        cam_card.grid(row=next_row(), column=0, sticky="ew", padx=sx, pady=(14, 0))
+        cam_card = customtkinter.CTkFrame(self._content, fg_color=_CLR_CARD, corner_radius=_CORNER_RADIUS, border_width=1, border_color=_CLR_SUBTLE_BORDER)
+        cam_card.grid(row=1, column=0, sticky="nsew", padx=sx, pady=(0, 10))
         cam_card.grid_columnconfigure(0, weight=1)
-        cam_card.grid_columnconfigure(1, weight=0)
+        cam_card.grid_rowconfigure(0, weight=1)     # preview expands
+        cam_card.grid_rowconfigure(1, weight=0)     # hint row
+        cam_card.grid_rowconfigure(2, weight=0)     # detection result
+        cam_card.grid_rowconfigure(3, weight=0)     # controls
+        cam_card.grid_rowconfigure(4, weight=0)     # settings (hidden)
 
-        # -- Header row: title + status --
-        cam_hdr = customtkinter.CTkFrame(cam_card, fg_color="transparent")
-        cam_hdr.grid(row=0, column=0, columnspan=2, sticky="ew", padx=14, pady=(12, 6))
-        cam_hdr.grid_columnconfigure(0, weight=1)
+        self.cam_preview_label = customtkinter.CTkLabel(cam_card, text="Memulai kamera...", font=(_FONT_PRIMARY[0], 13), text_color=_CLR_MUTED, fg_color="#111111", corner_radius=_CORNER_RADIUS)
+        self.cam_preview_label.grid(row=0, column=0, sticky="nsew", padx=12, pady=(12, 0))
 
-        customtkinter.CTkLabel(
-            cam_hdr, text="PENGATURAN KAMERA",
-            font=(_FONT_PRIMARY[0], 14, "bold"), text_color=_CLR_ACCENT,
-        ).grid(row=0, column=0, sticky="w")
+        hint_row = customtkinter.CTkFrame(cam_card, fg_color="transparent")
+        hint_row.grid(row=1, column=0, sticky="ew", padx=12, pady=(4, 0))
+        hint_row.grid_columnconfigure(0, weight=1)
 
-        self.cam_status_label = customtkinter.CTkLabel(
-            cam_hdr, text="Memuat...",
-            font=(_FONT_PRIMARY[0], 11), text_color=_CLR_MUTED,
-        )
-        self.cam_status_label.grid(row=0, column=1, sticky="e")
+        self._qr_hint_label = customtkinter.CTkLabel(hint_row, text="", font=(_FONT_PRIMARY[0], 10), text_color=_CLR_MUTED)
+        self._qr_hint_label.grid(row=0, column=0, sticky="w")
 
-        # -- Camera preview (left column) --
-        preview_col = customtkinter.CTkFrame(cam_card, fg_color="transparent")
-        preview_col.grid(row=1, column=0, sticky="nsew", padx=(14, 6), pady=(0, 12))
-        preview_col.grid_columnconfigure(0, weight=1)
+        self.cam_status_label = customtkinter.CTkLabel(hint_row, text="Memuat...", font=(_FONT_PRIMARY[0], 11), text_color=_CLR_MUTED)
+        self.cam_status_label.grid(row=0, column=1, sticky="e", padx=(12, 0))
 
-        self.cam_preview_label = customtkinter.CTkLabel(
-            preview_col, text="Memulai kamera...",
-            font=(_FONT_PRIMARY[0], 13), text_color=_CLR_MUTED,
-            fg_color="#111111", corner_radius=_CORNER_RADIUS,
-        )
-        self.cam_preview_label.grid(row=0, column=0, sticky="ew")
-        self.cam_preview_label.configure(height=240)
+        self.detect_result = customtkinter.CTkLabel(cam_card, text="", font=(_FONT_PRIMARY[0], 12), text_color=_CLR_MUTED, wraplength=400)
+        self.detect_result.grid(row=2, column=0, padx=12, pady=(2, 0), sticky="w")
 
-        # Detection result (below preview)
-        self.detect_result = customtkinter.CTkLabel(
-            preview_col, text="",
-            font=(_FONT_PRIMARY[0], 12), text_color=_CLR_MUTED,
-            wraplength=280,
-        )
-        self.detect_result.grid(row=1, column=0, pady=(4, 0), sticky="w")
-
-        # -- Controls (right column) --
-        ctrl_col = customtkinter.CTkFrame(cam_card, fg_color="transparent")
-        ctrl_col.grid(row=1, column=1, sticky="nsew", padx=(0, 14), pady=(0, 12))
-        ctrl_col.grid_columnconfigure(0, weight=1)
-
-        # Camera device selector
-        customtkinter.CTkLabel(
-            ctrl_col, text="Sumber Kamera",
-            font=(_FONT_PRIMARY[0], 12, "bold"), text_color=_CLR_TEXT,
-        ).grid(row=0, column=0, sticky="w", pady=(0, 4))
+        ctrl_row = customtkinter.CTkFrame(cam_card, fg_color="transparent")
+        ctrl_row.grid(row=3, column=0, sticky="ew", padx=12, pady=(8, 12))
 
         self._detecting_cameras = True
         self._available_cameras = []
-        self.cam_dropdown = customtkinter.CTkComboBox(
-            ctrl_col,
-            values=["Mendeteksi..."],
-            command=self._on_camera_change,
-            font=(_FONT_PRIMARY[0], 11),
-            fg_color=_CLR_BG, border_color=_CLR_SUBTLE_BORDER,
-            height=34,
-        )
-        self.cam_dropdown.grid(row=1, column=0, sticky="ew", pady=(0, 10))
+        self.cam_dropdown = customtkinter.CTkComboBox(ctrl_row, values=["Mendeteksi..."], command=self._on_camera_change, font=(_FONT_PRIMARY[0], 11), fg_color=_CLR_BG, border_color=_CLR_SUBTLE_BORDER, height=34, width=110)
+        self.cam_dropdown.pack(side="left", padx=(0, 6))
 
-        # Mirror checkboxes (side by side)
-        mirror_row = customtkinter.CTkFrame(ctrl_col, fg_color="transparent")
-        mirror_row.grid(row=2, column=0, sticky="ew", pady=(0, 8))
-        mirror_row.grid_columnconfigure((0, 1), weight=1)
+        self._mirror_x_active = CAMERA_MIRROR_X
+        self._mirror_btn = customtkinter.CTkButton(ctrl_row, text="↔", command=self._toggle_mirror_x, font=(_FONT_PRIMARY[0], 13, "bold"), fg_color=_CLR_BG if CAMERA_MIRROR_X else _CLR_CARD, hover_color=_CLR_SUBTLE_BORDER, text_color=_CLR_TEXT, corner_radius=_CORNER_RADIUS_SMALL, height=34, width=38)
+        self._mirror_btn.pack(side="left", padx=(0, 6))
 
-        self.mirror_x_var = customtkinter.BooleanVar(value=CAMERA_MIRROR_X)
-        customtkinter.CTkCheckBox(
-            mirror_row, text="Mirror ↔",
-            variable=self.mirror_x_var, font=(_FONT_PRIMARY[0], 12),
-            fg_color=_CLR_ACCENT, hover_color=_CLR_ACCENT2,
-            command=self._on_mirror_change,
-        ).grid(row=0, column=0, sticky="w")
+        for z in [1.0, 1.5, 2.0]:
+            customtkinter.CTkButton(ctrl_row, text=f"{z:.1f}x", command=lambda v=z: self._set_zoom(v), font=(_FONT_PRIMARY[0], 11, "bold"), fg_color=_CLR_BG, hover_color=_CLR_SUBTLE_BORDER, text_color=_CLR_TEXT, corner_radius=_CORNER_RADIUS_SMALL, height=34, width=42).pack(side="left", padx=(0, 4))
+
+        self.detect_btn = customtkinter.CTkButton(ctrl_row, text="Tes Blok", command=self._test_block_detection, font=(_FONT_PRIMARY[0], 11, "bold"), fg_color=_CLR_SUCCESS, hover_color=_CLR_SUCCESS_HOVER, text_color=_CLR_TEXT, corner_radius=_CORNER_RADIUS_SMALL, height=34)
+        self.detect_btn.pack(side="right", padx=(12, 4))
+
+        self._gear_btn = customtkinter.CTkButton(ctrl_row, text="⚙", command=self._toggle_cam_settings, font=(_FONT_PRIMARY[0], 13), fg_color=_CLR_BG, hover_color=_CLR_SUBTLE_BORDER, text_color=_CLR_TEXT, corner_radius=_CORNER_RADIUS_SMALL, height=34, width=38)
+        self._gear_btn.pack(side="right")
+
+        self._cam_settings = customtkinter.CTkFrame(cam_card, fg_color="transparent")
+        self._cam_settings.grid(row=4, column=0, sticky="ew", padx=12, pady=(0, 10))
+        self._cam_settings.grid_remove()
 
         self.mirror_y_var = customtkinter.BooleanVar(value=CAMERA_MIRROR_Y)
-        customtkinter.CTkCheckBox(
-            mirror_row, text="Mirror ↕",
-            variable=self.mirror_y_var, font=(_FONT_PRIMARY[0], 12),
-            fg_color=_CLR_ACCENT, hover_color=_CLR_ACCENT2,
-            command=self._on_mirror_change,
-        ).grid(row=0, column=1, sticky="w")
+        customtkinter.CTkCheckBox(self._cam_settings, text="Mirror ↕", variable=self.mirror_y_var, font=(_FONT_PRIMARY[0], 11), fg_color=_CLR_ACCENT, hover_color=_CLR_ACCENT2, command=self._on_mirror_change).pack(side="left", padx=(0, 12))
 
-        # Zoom slider
-        customtkinter.CTkLabel(
-            ctrl_col, text="Zoom",
-            font=(_FONT_PRIMARY[0], 12, "bold"), text_color=_CLR_TEXT,
-        ).grid(row=3, column=0, sticky="w", pady=(0, 2))
-
-        zoom_row = customtkinter.CTkFrame(ctrl_col, fg_color="transparent")
-        zoom_row.grid(row=4, column=0, sticky="ew", pady=(0, 4))
-        zoom_row.grid_columnconfigure(0, weight=1)
-
-        self.zoom_slider = customtkinter.CTkSlider(
-            zoom_row, from_=0.5, to=3.0, number_of_steps=25,
-            command=self._on_zoom_change,
-        )
+        self.zoom_slider = customtkinter.CTkSlider(self._cam_settings, from_=0.5, to=3.0, number_of_steps=25, command=self._on_zoom_change, width=160)
         self.zoom_slider.set(CAMERA_ZOOM)
-        self.zoom_slider.grid(row=0, column=0, sticky="ew")
+        self.zoom_slider.pack(side="left", padx=(0, 6))
 
-        self.zoom_label = customtkinter.CTkLabel(
-            zoom_row, text=f"{CAMERA_ZOOM:.1f}x",
-            font=(_FONT_PRIMARY[0], 13, "bold"), text_color=_CLR_ACCENT, width=44,
-        )
-        self.zoom_label.grid(row=0, column=1, padx=(8, 0))
+        self.zoom_label = customtkinter.CTkLabel(self._cam_settings, text=f"{CAMERA_ZOOM:.1f}x", font=(_FONT_PRIMARY[0], 12, "bold"), text_color=_CLR_ACCENT, width=42)
+        self.zoom_label.pack(side="left", padx=(0, 12))
 
-        # Zoom presets
-        preset_row = customtkinter.CTkFrame(ctrl_col, fg_color="transparent")
-        preset_row.grid(row=5, column=0, sticky="ew", pady=(0, 10))
-        preset_row.grid_columnconfigure((0, 1, 2), weight=1)
-        for i, z in enumerate([1.0, 1.5, 2.0]):
-            customtkinter.CTkButton(
-                preset_row, text=f"{z:.1f}x",
-                command=lambda v=z: self._set_zoom(v),
-                font=(_FONT_PRIMARY[0], 11, "bold"),
-                fg_color=_CLR_BG, hover_color=_CLR_SUBTLE_BORDER,
-                text_color=_CLR_TEXT, corner_radius=_CORNER_RADIUS_SMALL, height=32,
-            ).grid(row=0, column=i, padx=(0 if i == 0 else 3, 3 if i < 2 else 0), sticky="ew")
+        customtkinter.CTkButton(self._cam_settings, text="Simpan", command=self._save_camera_settings, font=(_FONT_PRIMARY[0], 11), fg_color=_CLR_ACCENT, hover_color=_CLR_ACCENT2, text_color=_CLR_TEXT, corner_radius=_CORNER_RADIUS_SMALL, height=30, width=80).pack(side="left")
 
-        # -- Action buttons --
-        btn_frame = customtkinter.CTkFrame(cam_card, fg_color="transparent")
-        btn_frame.grid(row=2, column=0, columnspan=2, sticky="ew", padx=14, pady=(0, 14))
-        btn_frame.grid_columnconfigure(0, weight=1)
-        btn_frame.grid_columnconfigure(1, weight=1)
+        # ── Main Action Button (bottom) ──────────────────────────────────────
+        self.button = customtkinter.CTkButton(self._content, text="MULAI TES", command=self.button_callback, font=(_FONT_PRIMARY[0], 20, "bold"), fg_color=_CLR_ACCENT, hover_color=_CLR_ACCENT2, text_color=_CLR_TEXT, corner_radius=_CORNER_RADIUS, height=56)
+        self.button.grid(row=2, column=0, sticky="ew", padx=sx, pady=(0, 14))
 
-        self.detect_btn = customtkinter.CTkButton(
-            btn_frame, text="Tes Deteksi Blok",
-            command=self._test_block_detection,
-            font=(_FONT_PRIMARY[0], 13, "bold"),
-            fg_color=_CLR_SUCCESS, hover_color=_CLR_SUCCESS_HOVER,
-            text_color=_CLR_TEXT,
-            corner_radius=_CORNER_RADIUS, height=44,
-        )
-        self.detect_btn.grid(row=0, column=0, padx=(0, 6), sticky="ew")
-
-        customtkinter.CTkButton(
-            btn_frame, text="Simpan Pengaturan",
-            command=self._save_camera_settings,
-            font=(_FONT_PRIMARY[0], 13, "bold"),
-            fg_color=_CLR_ACCENT, hover_color=_CLR_ACCENT2,
-            text_color=_CLR_TEXT,
-            corner_radius=_CORNER_RADIUS, height=44,
-        ).grid(row=0, column=1, padx=(6, 0), sticky="ew")
-
-        # ── Main Action Button ───────────────────────────────────────────────
-        self.button = customtkinter.CTkButton(
-            self._scroll,
-            text="MULAI TES",
-            command=self.button_callback,
-            font=(_FONT_PRIMARY[0], 20, "bold"),
-            fg_color=_CLR_ACCENT,
-            hover_color=_CLR_ACCENT2,
-            text_color=_CLR_TEXT,
-            corner_radius=_CORNER_RADIUS,
-            height=52,
-        )
-        self.button.grid(row=next_row(), column=0, sticky="ew", padx=20, pady=(16, 8))
-
-        # Competition mode buttons (hidden until UID verified)
-        self.mode_frame = customtkinter.CTkFrame(self._scroll, fg_color="transparent")
-        self.mode_frame.grid(row=row[0] - 1, column=0, sticky="ew", padx=20, pady=(16, 8))
+        self.mode_frame = customtkinter.CTkFrame(self._content, fg_color="transparent")
+        self.mode_frame.grid(row=2, column=0, sticky="ew", padx=sx, pady=(0, 14))
         self.mode_frame.grid_columnconfigure((0, 1), weight=1)
         self.mode_frame.grid_remove()
 
-        self.duel_btn = customtkinter.CTkButton(
-            self.mode_frame,
-            text="Duel 1v1",
-            command=self._start_duel,
-            font=(_FONT_PRIMARY[0], 14, "bold"),
-            fg_color=_CLR_ACCENT,
-            hover_color=_CLR_ACCENT2,
-            text_color=_CLR_TEXT,
-            corner_radius=_CORNER_RADIUS,
-            height=56,
-        )
+        self.duel_btn = customtkinter.CTkButton(self.mode_frame, text="Duel 1v1", command=self._start_duel, font=(_FONT_PRIMARY[0], 14, "bold"), fg_color=_CLR_ACCENT, hover_color=_CLR_ACCENT2, text_color=_CLR_TEXT, corner_radius=_CORNER_RADIUS, height=56)
         self.duel_btn.grid(row=0, column=0, padx=(0, 6), sticky="ew")
 
-        self.tournament_btn = customtkinter.CTkButton(
-            self.mode_frame,
-            text="Turnamen",
-            command=self._start_tournament,
-            font=(_FONT_PRIMARY[0], 14, "bold"),
-            fg_color=_CLR_CARD,
-            hover_color=_CLR_ACCENT,
-            text_color=_CLR_TEXT,
-            corner_radius=_CORNER_RADIUS,
-            height=56,
-        )
+        self.tournament_btn = customtkinter.CTkButton(self.mode_frame, text="Turnamen", command=self._start_tournament, font=(_FONT_PRIMARY[0], 14, "bold"), fg_color=_CLR_CARD, hover_color=_CLR_ACCENT, text_color=_CLR_TEXT, corner_radius=_CORNER_RADIUS, height=56)
         self.tournament_btn.grid(row=0, column=1, padx=(6, 0), sticky="ew")
 
-        # In training mode
-        if PC_MODE == "training":
-            self._uid_required = False
-            self.uid_status.configure(text="Mode Latihan — UID opsional", text_color=_CLR_MUTED)
-            self.button.configure(text="Mulai Latihan")
-        else:
-            self._uid_required = True
+        # Apply current mode styling (called once more below after QR init)
+        self._update_mode_buttons()
 
         # ── QR Code detection via camera preview ──────────────────────────
         self._qr_detector = None
@@ -1393,13 +1257,13 @@ class App_Input(customtkinter.CTk): #CTkToplevel
             if hasattr(_cv2, 'QRCodeDetector'):
                 self._qr_detector = _cv2.QRCodeDetector()
                 self._qr_available = True
+                self.qr_indicator.configure(text="● QR", text_color=_CLR_SUCCESS)
                 print(">>> [QR] QRCodeDetector initialized (OpenCV)")
             else:
-                print(">>> [QR] QRCodeDetector not available (OpenCV >= 4.5 required)")
-                self.qr_indicator.configure(text="✗QR", text_color=_CLR_MUTED)
+                self.qr_indicator.configure(text="✗ QR", text_color=_CLR_DANGER)
         except Exception as e:
             print(f">>> [QR] Failed to init QR detector: {e}")
-            self.qr_indicator.configure(text="✗QR", text_color=_CLR_MUTED)
+            self.qr_indicator.configure(text="✗ QR", text_color=_CLR_DANGER)
         self._qr_last_detected_ts = 0.0
         self._qr_cooldown = 3.0  # seconds between detections
 
@@ -1417,6 +1281,27 @@ class App_Input(customtkinter.CTk): #CTkToplevel
         import tkinter.messagebox as mb
         mb.showinfo("Tema Diubah", "Restart aplikasi untuk menerapkan tema baru.")
         self.theme_btn.configure(text="Dark" if new_theme == 'light' else "Light")
+
+    def _on_mode_change(self, mode):
+        global CURRENT_MODE
+        if CURRENT_MODE == mode:
+            return
+        CURRENT_MODE = mode
+        self._reset_scan()
+        self._update_mode_buttons()
+
+    def _update_mode_buttons(self):
+        is_training = CURRENT_MODE == "training"
+        self._mode_btn_training.configure(
+            fg_color=_CLR_ACCENT if is_training else _CLR_BG,
+            text_color=_CLR_TEXT,
+        )
+        self._mode_btn_competition.configure(
+            fg_color=_CLR_ACCENT if not is_training else _CLR_BG,
+            text_color=_CLR_TEXT,
+        )
+        self._uid_required = not is_training
+        self.button.configure(text="Mulai Latihan" if is_training else "MULAI TES")
 
     # ── Camera preview loop ───────────────────────────────────────────────
     def _start_camera_preview(self):
@@ -1473,9 +1358,24 @@ class App_Input(customtkinter.CTk): #CTkToplevel
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
         print(f">>> Camera switched to index {idx}")
 
+    def _toggle_mirror_x(self):
+        global CAMERA_MIRROR_X
+        self._mirror_x_active = not self._mirror_x_active
+        CAMERA_MIRROR_X = self._mirror_x_active
+        self._mirror_btn.configure(
+            fg_color=_CLR_BG if CAMERA_MIRROR_X else _CLR_CARD
+        )
+
+    def _toggle_cam_settings(self):
+        if self._cam_settings.winfo_ismapped():
+            self._cam_settings.grid_remove()
+            self._gear_btn.configure(fg_color=_CLR_BG)
+        else:
+            self._cam_settings.grid()
+            self._gear_btn.configure(fg_color=_CLR_SUBTLE_BORDER)
+
     def _on_mirror_change(self):
-        global CAMERA_MIRROR_X, CAMERA_MIRROR_Y
-        CAMERA_MIRROR_X = self.mirror_x_var.get()
+        global CAMERA_MIRROR_Y
         CAMERA_MIRROR_Y = self.mirror_y_var.get()
 
     def _on_zoom_change(self, value):
@@ -1496,7 +1396,7 @@ class App_Input(customtkinter.CTk): #CTkToplevel
         mb.showinfo("Tersimpan", "Pengaturan kamera disimpan ke .env")
 
     def _test_block_detection(self):
-        self.detect_btn.configure(state="disabled", text="Mendeteksi...")
+        self.detect_btn.configure(state="disabled", text="Deteksi...")
         self.detect_result.configure(text="Menjalankan deteksi blok...", text_color=_CLR_MUTED)
         threading.Thread(target=self._run_detection_test, daemon=True).start()
 
@@ -1505,14 +1405,14 @@ class App_Input(customtkinter.CTk): #CTkToplevel
             if cap is None or not cap.isOpened():
                 self.after(0, lambda: self.detect_result.configure(
                     text="✗ Kamera tidak tersedia", text_color=_CLR_DANGER))
-                self.after(0, lambda: self.detect_btn.configure(state="normal", text="Tes Deteksi Blok"))
+                self.after(0, lambda: self.detect_btn.configure(state="normal", text="Tes Blok"))
                 return
 
             ret, frame = cap.read()
             if not ret or frame is None:
                 self.after(0, lambda: self.detect_result.configure(
                     text="✗ Gagal membaca kamera", text_color=_CLR_DANGER))
-                self.after(0, lambda: self.detect_btn.configure(state="normal", text="Tes Deteksi Blok"))
+                self.after(0, lambda: self.detect_btn.configure(state="normal", text="Tes Blok"))
                 return
 
             # Run YOLO detection
@@ -1540,11 +1440,10 @@ class App_Input(customtkinter.CTk): #CTkToplevel
             self.after(0, lambda: self.detect_result.configure(
                 text="✗ Deteksi gagal — periksa kamera", text_color=_CLR_DANGER))
         finally:
-            self.after(0, lambda: self.detect_btn.configure(state="normal", text="Tes Deteksi Blok"))
+            self.after(0, lambda: self.detect_btn.configure(state="normal", text="Tes Blok"))
 
     def _preview_loop(self):
         import cv2 as _cv2
-        pw, ph = 400, 280
         _qframe = 0
         while self._preview_running:
             try:
@@ -1555,6 +1454,12 @@ class App_Input(customtkinter.CTk): #CTkToplevel
                 if not ret or frame is None:
                     time.sleep(0.05)
                     continue
+
+                # Get actual label dimensions so preview fills the space
+                w = self.cam_preview_label.winfo_width()
+                h = self.cam_preview_label.winfo_height()
+                pw = max(w, 400) if w > 1 else 520
+                ph = max(h, 300) if h > 1 else 360
 
                 # ── QR Code detection (every 5 frames, BGR) ──────────────
                 _qframe += 1
@@ -1597,37 +1502,29 @@ class App_Input(customtkinter.CTk): #CTkToplevel
 
     # ── QR Code auto-fill ─────────────────────────────────────────────────
     def _on_qr_detected(self, uid):
-        """QR code detected in camera preview — auto-fill UID field."""
+        """QR code detected in camera preview — auto-fill UID + auto-verify."""
         current_uid = self.textbox_frame_uid.get().strip()
         if current_uid == uid:
-            return  # already filled with this UID
+            return
 
         print(f">>> [QR] Detected UID: {uid}")
         self.textbox_frame_uid.set_text(uid)
-        self.uid_status.configure(
-            text=f"◉ QR terdeteksi: {uid} — tekan Enter untuk cek",
-            text_color=_CLR_ACCENT,
-        )
-        self.qr_indicator.configure(
-            text="✓ QR",
-            text_color=_CLR_SUCCESS,
-            fg_color=_CLR_SUCCESS + "20",
-        )
-        self.after(2500, lambda: self.qr_indicator.configure(
-            text="QR",
-            text_color=_CLR_MUTED,
-            fg_color="transparent",
-        ))
+        self.qr_indicator.configure(text="✓ QR", text_color=_CLR_SUCCESS)
+        self._qr_hint_label.configure(text="")
+        self._cek_uid()  # auto-verify — no need to click CEK
 
     def report_callback_exception(self, exc, val, tb):
         log_exception("Tk callback exception (App_Input)", exc, val, tb)
 
     def _cek_uid(self):
         """Verify UID against server, autofill participant data."""
+        if getattr(self, '_cek_in_progress', False):
+            return
         uid = self.textbox_frame_uid.get().strip()
         if not uid:
             self.uid_status.configure(text="Masukkan UID dulu", text_color=_CLR_DANGER)
             return
+        self._cek_in_progress = True
         self.cek_uid_btn.configure(state="disabled", text="...")
         self.reset_btn.configure(state="disabled")
         self.uid_status.configure(text="Mengecek ke server...", text_color=_CLR_MUTED)
@@ -1646,22 +1543,30 @@ class App_Input(customtkinter.CTk): #CTkToplevel
         age_range_code = 0
         TOURNAMENT_MODE = False
 
-        self.textbox_frame_uid.set_text(" ")
+        self.textbox_frame_uid.set_text("")  # clear UID field
         self.participant_info.configure(text="Belum ada peserta", text_color=_CLR_MUTED)
         self.uid_status.configure(text="", text_color=_CLR_MUTED)
         self.cek_uid_btn.configure(state="normal", text="CEK")
         self.reset_btn.configure(state="normal")
         self.info_box.grid_remove()
         self._qr_last_detected_ts = 0.0  # allow QR re-scan
+        self._qr_hint_label.configure(text="")  # clear, preview will redraw
+        self.qr_indicator.configure(
+            text="● QR ON" if self._qr_available else "✗ QR",
+            text_color=_CLR_SUCCESS if self._qr_available else _CLR_DANGER,
+        )
 
-        if PC_MODE == "training":
+        if CURRENT_MODE == "training":
             self.uid_status.configure(text="Mode Latihan — UID opsional", text_color=_CLR_MUTED)
+            self.button.grid()
+            self.mode_frame.grid_remove()
         else:
-            self.button.grid()          # show training-style button
-            self.mode_frame.grid_remove()  # hide mode selection
+            self.button.grid()
+            self.mode_frame.grid_remove()
 
     def _on_uid_result(self, exists, data, uid):
         """Handle verify result — store UID + autofill participant data from server."""
+        self._cek_in_progress = False
         self.cek_uid_btn.configure(state="normal", text="Cek")
         self.reset_btn.configure(state="normal")
         if not exists:
@@ -1690,7 +1595,7 @@ class App_Input(customtkinter.CTk): #CTkToplevel
         self.info_box.grid()
         print(f">>> UID verified: {uid}, participant: {nick_name}")
 
-        if PC_MODE == "competition":
+        if CURRENT_MODE == "competition":
             self.uid_status.configure(text="Mengecek jadwal turnamen...", text_color=_CLR_MUTED)
             def _on_tournament_check(has_match, match_data):
                 self.after(0, lambda: self._on_tournament_result(has_match, match_data))
@@ -1722,7 +1627,7 @@ class App_Input(customtkinter.CTk): #CTkToplevel
             print(">>> No active tournament match for this UID")
 
         # Show mode selection buttons in competition mode
-        if PC_MODE == "competition":
+        if CURRENT_MODE == "competition":
             self.button.grid_remove()
             self.mode_frame.grid()
             self.duel_btn.configure(state="normal")
@@ -1796,12 +1701,12 @@ cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 print(">>> Start Test ...")
 
 try:
-    if PC_MODE == "training":
+    if CURRENT_MODE == "training":
         nick_name = "training_user"
         gender_code = ""
         age_range_code = 0
         current_participant_uid = ""
-        print(">>> PC_MODE=training — App_Input optional, using placeholder data")
+        print(">>> CURRENT_MODE=training — App_Input optional, using placeholder data")
         app_input = App_Input()
         app_input._start_camera_preview()
         app_input.after(0, lambda: app_input.attributes('-zoomed', True) if sys.platform == 'linux' else app_input.state('zoomed'))
@@ -2105,6 +2010,16 @@ class TimeIn(customtkinter.CTk):
         )
         self.level_text.grid(row=0, column=0, sticky="w")
 
+        # Opponent badge — always visible in multiplayer (regardless of DISPLAY_HALF)
+        self._opponent_badge = customtkinter.CTkLabel(
+            level_header, text="",
+            font=(_FONT_PRIMARY[0], 12, "bold"), text_color=_CLR_MUTED, anchor="e",
+        )
+        if IS_MULTIPLAYER:
+            self._opponent_badge.configure(text="Lawan: --", text_color=_CLR_MUTED)
+            self._opponent_badge.grid(row=0, column=1, sticky="e")
+        self._opponent_finished_label = None
+
         # Exit button — placed directly on window so it's always visible
         self._exit_btn = customtkinter.CTkButton(
             self, text="✕ Keluar",
@@ -2316,21 +2231,10 @@ class TimeIn(customtkinter.CTk):
             self.bottom_container.grid_propagate(False)
             self.status_label = customtkinter.CTkLabel(
                 self.bottom_container,
-                text=f"MODE: {PC_MODE.upper()}  |  LEVEL 1/{MAX_LEVEL}",
+                text=f"MODE: {CURRENT_MODE.upper()}  |  LEVEL 1/{MAX_LEVEL}",
                 font=(_FONT_PRIMARY[0], 12, "bold"), text_color=_CLR_ACCENT, anchor="w",
             )
             self.status_label.pack(side="left", padx=20, pady=8)
-
-            # Opponent badge (only visible in multiplayer)
-            self._opponent_badge = customtkinter.CTkLabel(
-                self.bottom_container,
-                text="", font=(_FONT_PRIMARY[0], 12, "bold"),
-                text_color=_CLR_MUTED, anchor="e",
-            )
-            if IS_MULTIPLAYER:
-                self._opponent_badge.configure(text="Lawan: --", text_color=_CLR_MUTED)
-                self._opponent_badge.pack(side="right", padx=20, pady=8)
-            self._opponent_finished_label = None
 
         #self.start_zero = time.time()
         #self.start_thumb = time.time()
@@ -2496,9 +2400,12 @@ class TimeIn(customtkinter.CTk):
     def _setup_ws_for_game(self):
         """Connect WS for in-game opponent tracking (called if not already connected via App_Room)."""
         global _ws_client
-        if _ws_client and _ws_client.connected:
+        if _ws_client:
             _ws_client.on_message = self._on_ws_game_message
-            return
+            if _ws_client.connected:
+                return
+            # Close stale connection before creating a new one
+            _ws_client.close()
         if not API_SERVER_URL or not CURRENT_ROOM_CODE:
             return
         _ws_client = GameWebSocket(
@@ -2531,6 +2438,7 @@ class TimeIn(customtkinter.CTk):
             opp_num = data.get("player_num", 0)
             if opp_num != PLAYER_NUM:
                 _opponent_level = data.get("level", _opponent_level)
+                _opponent_blocks = 0  # reset time for new level
                 _opponent_name = data.get("player_name", _opponent_name or "Lawan")
                 self._update_opponent_badge()
 
@@ -2643,42 +2551,43 @@ class TimeIn(customtkinter.CTk):
         self.current_level_button.grid_remove()
         self.timer_task_avg = format(float(sum(self.timer_task_all) / len(self.timer_task_all)), ".3f")
 
-        is_duel = PC_MODE == "competition" or TOURNAMENT_MODE
+        age_real = int(self.age_range_code)
+        total_time = float(sum(self.timer_task_all))
+
+        is_duel = CURRENT_MODE == "competition" or TOURNAMENT_MODE
         if is_duel:
-            # Pure speed scoring for duel/competition/tournament
-            age_real = int(self.age_range_code)
-            total_time = float(sum(self.timer_task_all))
+            # Pure speed scoring for duel/competition/tournament — no cognitive age display
             print("Your name is " + self.nick_name)
             print("Your gender is " + self.gender_code)
             print("Your Total Time is " + str(round(total_time, 2)) + " seconds")
+            print("Your Average Completed Time is " + str(self.timer_task_avg) + " second")
+            print("Your Current Age is " + str(age_real) + " years")
             play_sfx('complete')
             self._show_celebration("TES SELESAI!", duration=2500)
-            self.after(2500, lambda: self._finish_test(100, None, None, None, age_real, 0))
+            self.after(2500, lambda: self._finish_test(total_time, age_real, 0, 0, []))
             return
 
-        cognitive_age_avg = int(sum(self.cognitive_age_list) / len(self.cognitive_age_list))
-        age_real = int(self.age_range_code)
+        # Training mode: compute cognitive age + visuo_spatial for data collection
+        cognitive_age_avg = int(sum(self.cognitive_age_list) / len(self.cognitive_age_list)) if self.cognitive_age_list else 0
         age_cog = cognitive_age_avg
 
         visuo_spatial = 100
-
-        if age_cog <= age_real:
-            visuo_spatial = 100 
-        else:
-            visuo_spatial = 100 - (age_cog - age_real)
+        if age_cog > age_real:
+            visuo_spatial = max(0, 100 - (age_cog - age_real))
 
         print("Your name is " + self.nick_name)
         print("Your gender is " + self.gender_code)
         print("Your Average Completed Time is " + str(self.timer_task_avg) + " second")
         print("Your Current Age is " + str(age_real) + " years")
         print("Your Cognitive Age is " + str(age_cog) + " years")
-        print("Your Cognitive Fitness is " + str(visuo_spatial) + " %")
+        print("Your Visuo-Spatial Fitness is " + str(visuo_spatial) + " %")
+        print("Your Total Time is " + str(round(total_time, 2)) + " seconds")
 
         play_sfx('complete')
         self._show_celebration("TES SELESAI!", duration=2500)
-        self.after(2500, lambda: self._finish_test(visuo_spatial, None, None, None, age_real, age_cog))
+        self.after(2500, lambda: self._finish_test(total_time, age_real, age_cog, visuo_spatial, list(self.cognitive_age_list)))
 
-    def _finish_test(self, visuo_spatial, times, avg_time_all, estimated_age, age_real, age_cog):
+    def _finish_test(self, total_time, age_real, age_cog=0, visuo_spatial=0, cog_age_list=None):
         """Called after celebration flash — submit results and build dashboard."""
         try:
             global current_participant_uid
@@ -2686,14 +2595,14 @@ class TimeIn(customtkinter.CTk):
             name = self.nick_name
             real_age = int(self.age_range_code)
             gender = self.gender_code
-            estimated_age = int(age_cog)
             avg_time_all = float(self.timer_task_avg)
             times = self.timer_task_all
             uid = current_participant_uid
+            cl = cog_age_list if cog_age_list is not None else []
 
             payload = {
                 "uid":           uid,
-                "mode":          "tournament" if TOURNAMENT_MODE else PC_MODE,
+                "mode":          "tournament" if TOURNAMENT_MODE else CURRENT_MODE,
                 "nick_name":     name,
                 "gender":        gender,
                 "age":           real_age,
@@ -2706,9 +2615,9 @@ class TimeIn(customtkinter.CTk):
                 "task07":       float(times[6]) if len(times) > 6 else 0.0,
                 "task08":       float(times[7]) if len(times) > 7 else 0.0,
                 "task_avg":      avg_time_all,
-                "cognitive_age": estimated_age,
+                "cognitive_age": age_cog,
                 "visuo_spatial": visuo_spatial,
-                "cog_age_list":  self.cognitive_age_list,
+                "cog_age_list":  cl,
                 "variant_list":  self.variant_played_list,
                 "client_ts":     int(time.time()),
             }
@@ -2720,7 +2629,7 @@ class TimeIn(customtkinter.CTk):
                 print(f">>> [LOCAL] Training results saved without UID (uid={uid!r})")
 
             # Compute score for tournament/duel (pure speed: lower = faster)
-            is_duel = PC_MODE == "competition" or TOURNAMENT_MODE
+            is_duel = CURRENT_MODE == "competition" or TOURNAMENT_MODE
             total_time_score = float(sum(t for t in self.timer_task_all))
 
             # Tournament cup: report match finished with score
@@ -2754,9 +2663,9 @@ class TimeIn(customtkinter.CTk):
         except Exception as e:
             print(f">>> [API] Error saving participant: {e}")
 
-        self._build_results_dashboard(age_real, age_cog, visuo_spatial)
+        self._build_results_dashboard(age_real, total_time, age_cog, visuo_spatial)
 
-    def _build_results_dashboard(self, age_real, age_cog, visuo_spatial):
+    def _build_results_dashboard(self, age_real, total_time, age_cog=0, visuo_spatial=0):
         """Show a celebratory results card with scores and per-level breakdown."""
         self._duel_result_label = None
         self._duel_p1_score_label = None
@@ -2783,7 +2692,7 @@ class TimeIn(customtkinter.CTk):
         line = customtkinter.CTkFrame(self.results_frame, fg_color=_CLR_ACCENT, height=3, corner_radius=0)
         line.grid(row=1, column=0, sticky="ew", padx=20, pady=(0, 16))
 
-        # Main score card with stars
+        # Main score card — total time (lower = faster)
         trophy = customtkinter.CTkFrame(
             self.results_frame, fg_color=_CLR_BG, corner_radius=_CORNER_RADIUS,
             border_width=2, border_color=_CLR_GOLD,
@@ -2791,17 +2700,17 @@ class TimeIn(customtkinter.CTk):
         trophy.grid(row=2, column=0, sticky="ew", padx=20, pady=(0, 16))
         trophy.grid_columnconfigure(0, weight=1)
 
-        # Star rating based on visuo_spatial
-        if visuo_spatial >= 90:
+        # Star rating based on total time (faster = more stars)
+        if total_time < 60:
             stars = "⭐⭐⭐⭐⭐"
             star_label = "LUAR BIASA!"
-        elif visuo_spatial >= 75:
+        elif total_time < 90:
             stars = "⭐⭐⭐⭐"
             star_label = "HEBAT!"
-        elif visuo_spatial >= 60:
+        elif total_time < 120:
             stars = "⭐⭐⭐"
             star_label = "BAGUS!"
-        elif visuo_spatial >= 40:
+        elif total_time < 180:
             stars = "⭐⭐"
             star_label = "LUMAYAN"
         else:
@@ -2814,7 +2723,7 @@ class TimeIn(customtkinter.CTk):
         ).grid(row=0, column=0, pady=(16, 2))
 
         customtkinter.CTkLabel(
-            trophy, text=f"{visuo_spatial}%",
+            trophy, text=f"{total_time:.1f}s",
             font=(_FONT_PRIMARY[0], 52, "bold"), text_color=_CLR_GOLD,
         ).grid(row=1, column=0, pady=(0, 2))
 
@@ -2824,14 +2733,26 @@ class TimeIn(customtkinter.CTk):
         ).grid(row=2, column=0, pady=(0, 2))
 
         customtkinter.CTkLabel(
-            trophy, text="Kebugaran Visual-Spasial",
+            trophy, text="Total Waktu",
             font=(_FONT_PRIMARY[0], 13), text_color=_CLR_MUTED,
         ).grid(row=3, column=0, pady=(0, 16))
 
         # Stats row
+        is_duel = CURRENT_MODE == "competition" or TOURNAMENT_MODE
         stats = customtkinter.CTkFrame(self.results_frame, fg_color="transparent")
         stats.grid(row=3, column=0, sticky="ew", padx=20, pady=(0, 12))
-        stats.grid_columnconfigure((0, 1), weight=1)
+
+        if is_duel:
+            # Duel mode: show age + total time only
+            stats.grid_columnconfigure((0, 1), weight=1)
+            _stat_card(stats, "Usia", f"{age_real} th").grid(row=0, column=0, padx=(0, 8), sticky="ew")
+            _stat_card(stats, "Total Waktu", f"{total_time:.1f}s").grid(row=0, column=1, padx=(8, 0), sticky="ew")
+        else:
+            # Training mode: show age + cognitive age + visuo-spatial
+            stats.grid_columnconfigure((0, 1, 2), weight=1)
+            _stat_card(stats, "Usia", f"{age_real} th").grid(row=0, column=0, padx=(0, 4), sticky="ew")
+            _stat_card(stats, "Usia Kognitif", f"{age_cog} th").grid(row=0, column=1, padx=4, sticky="ew")
+            _stat_card(stats, "Visual-Spasial", f"{visuo_spatial}%").grid(row=0, column=2, padx=(4, 0), sticky="ew")
 
         def _stat_card(parent, title, value):
             c = customtkinter.CTkFrame(parent, fg_color=_CLR_CARD, corner_radius=_CORNER_RADIUS, border_width=1, border_color=_CLR_SUBTLE_BORDER)
@@ -2839,9 +2760,6 @@ class TimeIn(customtkinter.CTk):
             customtkinter.CTkLabel(c, text=title, font=(_FONT_PRIMARY[0], 12), text_color=_CLR_MUTED).grid(row=0, column=0, pady=(12, 0))
             customtkinter.CTkLabel(c, text=value, font=(_FONT_PRIMARY[0], 20, "bold"), text_color=_CLR_TEXT).grid(row=1, column=0, pady=(0, 12))
             return c
-
-        _stat_card(stats, "Usia", f"{age_real} th").grid(row=0, column=0, padx=(0, 8), sticky="ew")
-        _stat_card(stats, "Usia Kognitif", f"{age_cog} th").grid(row=0, column=1, padx=(8, 0), sticky="ew")
 
         # Duel / Tournament result banner
         if IS_MULTIPLAYER and CURRENT_ROOM_CODE:
@@ -2964,7 +2882,7 @@ class TimeIn(customtkinter.CTk):
             font=(_FONT_PRIMARY[0], 14, "bold"),
             fg_color=_CLR_CARD, hover_color=_CLR_SUBTLE_BORDER,
             text_color=_CLR_TEXT, corner_radius=_CORNER_RADIUS, height=52,
-            command=lambda: self._copy_results(visuo_spatial, age_real, age_cog),
+            command=lambda: self._copy_results(total_time, age_real),
         ).grid(row=0, column=1, padx=4, sticky="ew")
         customtkinter.CTkButton(
             btn_frame, text="✕ Ganti Peserta",
@@ -2974,10 +2892,10 @@ class TimeIn(customtkinter.CTk):
             command=self._switch_player,
         ).grid(row=0, column=2, padx=(4, 0), sticky="ew")
 
-    def _copy_results(self, visuo_spatial, age_real, age_cog):
+    def _copy_results(self, total_time, age_real):
         """Copy results to clipboard."""
         level_reached = sum(1 for t in self.timer_task_all if t > 0) if self.timer_task_all else 0
-        text = f"BDT Result | VS: {visuo_spatial}% | Usia: {age_real} | Kognitif: {age_cog} | Level: {level_reached}/{MAX_LEVEL}"
+        text = f"BDT Result | Total: {total_time:.1f}s | Usia: {age_real} | Level: {level_reached}/{MAX_LEVEL}"
         if self.timer_task_all:
             text += " | " + " ".join(f"L{i+1}:{t:.1f}s" for i, t in enumerate(self.timer_task_all))
         self.clipboard_clear()
@@ -2985,7 +2903,7 @@ class TimeIn(customtkinter.CTk):
         print(f">>> Results copied to clipboard")
     
     def skip_current_level(self, event=None):
-        """Surrender the current level — record 0.0 score, no cognitive age contribution."""
+        """Surrender the current level — record 0.0 score."""
         if not hasattr(self, 'current_question') or not hasattr(self, 'timer_running') or not self.timer_running:
             return
 
@@ -3089,39 +3007,11 @@ class TimeIn(customtkinter.CTk):
 
 
     def estimate_cognitive_age(self, time_finish_one_task):
-        
-        from sklearn.preprocessing import PolynomialFeatures
-        from sklearn.linear_model import LinearRegression
-
-        # Transform the input features to higher-degree polynomials, Create a polynomial regression model
-        # Fit the model to the transformed data, Predict y values for new x values
-
-        degree = 2
-        poly_features = PolynomialFeatures(degree=degree)
-
-        #x_time      = np.array([13, 14, 15, 16, 17, 18, 22, 25, 30, 33, 37, 40, 45, 50]).reshape(-1, 1)
-        
-        x_time      = np.array([ 9, 10, 11, 12, 14, 16, 18, 20, 25, 30, 35, 40, 45, 50]).reshape(-1, 1)
-        y_age       = np.array([20, 25, 30, 35, 40, 45, 50, 55, 60, 65, 70, 75, 80, 85])
-
-        time_avg = time_finish_one_task # * 1.5  # second
-
-        x_time_poly = poly_features.fit_transform(x_time)
-        model_time = LinearRegression()
-        model_time.fit(x_time_poly, y_age)
-
-        new_x_time = np.array([time_avg]).reshape(-1, 1)
-        new_x_time_poly = poly_features.transform(new_x_time)
-        cognitive_age = model_time.predict(new_x_time_poly)[0]
-
-        if cognitive_age < 20:
-            cognitive_age = 20
-        elif cognitive_age > 85:
-            cognitive_age = 90
-        
-        return int(cognitive_age)
-
-        #print("Estimated Cognitive Age : " + str(round(cognitive_age[0], 1)) + " years")
+        # Linear interpolation on pre-computed time-to-age mapping
+        x_time = np.array([9, 10, 11, 12, 14, 16, 18, 20, 25, 30, 35, 40, 45, 50])
+        y_age  = np.array([20, 25, 30, 35, 40, 45, 50, 55, 60, 65, 70, 75, 80, 85])
+        age = int(np.interp(time_finish_one_task, x_time, y_age))
+        return max(20, min(90, age))
 
     def _update_level_badge(self, level, state="active"):
         """Update progress badges: completed = gold ✓, active = red, upcoming = muted."""
@@ -3169,15 +3059,13 @@ class TimeIn(customtkinter.CTk):
         
         self.current_level_button.grid(row=1, column=0, columnspan=2, padx=20, pady=10, sticky="ew")
         if hasattr(self, 'status_label'):
-            self.status_label.configure(text=f"MODE: {PC_MODE.upper()}  |  LEVEL {level}/{MAX_LEVEL}")
+            self.status_label.configure(text=f"MODE: {CURRENT_MODE.upper()}  |  LEVEL {level}/{MAX_LEVEL}")
         
         self._update_level_badge(level, state="active")
         self._update_stars(level)
     
     def retry_test(self):
         """Replay with the same player — skip App_Input, go straight to game."""
-        self.destroy()
-
         global _ws_client, _opponent_level, _opponent_blocks, _opponent_finished, _opponent_name
         _opponent_level = 0
         _opponent_blocks = 0
@@ -3186,8 +3074,9 @@ class TimeIn(customtkinter.CTk):
         if _ws_client:
             _ws_client.close()
             _ws_client = None
+        self.destroy()
 
-        if PC_MODE == "competition":
+        if CURRENT_MODE == "competition":
             global IS_MULTIPLAYER, CURRENT_ROOM_CODE, PLAYER_NUM
             IS_MULTIPLAYER = True
             app_room = App_Room()
@@ -3203,8 +3092,6 @@ class TimeIn(customtkinter.CTk):
 
     def _switch_player(self):
         """Go back to App_Input to register a new participant."""
-        self.destroy()
-
         global IS_MULTIPLAYER, CURRENT_ROOM_CODE, PLAYER_NUM, current_participant_uid, nick_name, gender_code, age_range_code, TOURNAMENT_MODE, TOURNAMENT_ROOM_CODE, TOURNAMENT_OPPONENT, TOURNAMENT_IS_P1, TOURNAMENT_ROUND, _ws_client, _opponent_level, _opponent_blocks, _opponent_finished, _opponent_name
         IS_MULTIPLAYER    = False
         CURRENT_ROOM_CODE = ''
@@ -3225,6 +3112,7 @@ class TimeIn(customtkinter.CTk):
         if _ws_client:
             _ws_client.close()
             _ws_client = None
+        self.destroy()
 
         app_input = App_Input()
         app_input._start_camera_preview()
@@ -3233,7 +3121,7 @@ class TimeIn(customtkinter.CTk):
         if not nick_name:
             return
 
-        if PC_MODE == "competition":
+        if CURRENT_MODE == "competition":
             IS_MULTIPLAYER = True
             app_room = App_Room()
             app_room.mainloop()
@@ -4058,6 +3946,7 @@ class TimeIn(customtkinter.CTk):
     
     def destroy(self):
         """Override destroy to cleanup resources"""
+        self._stop_heartbeat()
         self.cleanup()
         super().destroy()
 
@@ -4868,7 +4757,7 @@ if __name__ == "__main__":
             raise SystemExit(0)
 
         # Competition: go to App_Room first (duel) — skip if tournament match already assigned
-        if PC_MODE == "competition":
+        if CURRENT_MODE == "competition":
             IS_MULTIPLAYER = True
             if TOURNAMENT_MODE and TOURNAMENT_ROOM_CODE:
                 # Tournament cup: use pre-assigned room code, skip lobby
