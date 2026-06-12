@@ -1176,7 +1176,6 @@ class App_Input(customtkinter.CTk): #CTkToplevel
         cam_card.grid_rowconfigure(1, weight=0)     # hint row
         cam_card.grid_rowconfigure(2, weight=0)     # detection result
         cam_card.grid_rowconfigure(3, weight=0)     # controls
-        cam_card.grid_rowconfigure(4, weight=0)     # settings (hidden)
 
         self.cam_preview_label = customtkinter.CTkLabel(cam_card, text="Memulai kamera...", font=(_FONT_PRIMARY[0], 13), text_color=_CLR_MUTED, fg_color="#111111", corner_radius=_CORNER_RADIUS)
         self.cam_preview_label.grid(row=0, column=0, sticky="nsew", padx=12, pady=(12, 0))
@@ -1209,27 +1208,23 @@ class App_Input(customtkinter.CTk): #CTkToplevel
         for z in [1.0, 1.5, 2.0]:
             customtkinter.CTkButton(ctrl_row, text=f"{z:.1f}x", command=lambda v=z: self._set_zoom(v), font=(_FONT_PRIMARY[0], 11, "bold"), fg_color=_CLR_BG, hover_color=_CLR_SUBTLE_BORDER, text_color=_CLR_TEXT, corner_radius=_CORNER_RADIUS_SMALL, height=34, width=42).pack(side="left", padx=(0, 4))
 
-        self.detect_btn = customtkinter.CTkButton(ctrl_row, text="Tes Blok", command=self._test_block_detection, font=(_FONT_PRIMARY[0], 11, "bold"), fg_color=_CLR_SUCCESS, hover_color=_CLR_SUCCESS_HOVER, text_color=_CLR_TEXT, corner_radius=_CORNER_RADIUS_SMALL, height=34)
-        self.detect_btn.pack(side="right", padx=(12, 4))
+        self._mirror_y_active = CAMERA_MIRROR_Y
+        self._mirror_y_btn = customtkinter.CTkButton(ctrl_row, text="↕", command=self._toggle_mirror_y, font=(_FONT_PRIMARY[0], 13, "bold"), fg_color=_CLR_BG if CAMERA_MIRROR_Y else _CLR_CARD, hover_color=_CLR_SUBTLE_BORDER, text_color=_CLR_TEXT, corner_radius=_CORNER_RADIUS_SMALL, height=34, width=38)
+        self._mirror_y_btn.pack(side="left", padx=(0, 2))
 
-        self._gear_btn = customtkinter.CTkButton(ctrl_row, text="⚙", command=self._toggle_cam_settings, font=(_FONT_PRIMARY[0], 13), fg_color=_CLR_BG, hover_color=_CLR_SUBTLE_BORDER, text_color=_CLR_TEXT, corner_radius=_CORNER_RADIUS_SMALL, height=34, width=38)
-        self._gear_btn.pack(side="right")
+        customtkinter.CTkLabel(ctrl_row, text="Zoom", font=(_FONT_PRIMARY[0], 10), text_color=_CLR_MUTED).pack(side="left", padx=(0, 2))
 
-        self._cam_settings = customtkinter.CTkFrame(cam_card, fg_color="transparent")
-        self._cam_settings.grid(row=4, column=0, sticky="ew", padx=12, pady=(0, 10))
-        self._cam_settings.grid_remove()
-
-        self.mirror_y_var = customtkinter.BooleanVar(value=CAMERA_MIRROR_Y)
-        customtkinter.CTkCheckBox(self._cam_settings, text="Mirror ↕", variable=self.mirror_y_var, font=(_FONT_PRIMARY[0], 11), fg_color=_CLR_ACCENT, hover_color=_CLR_ACCENT2, command=self._on_mirror_change).pack(side="left", padx=(0, 12))
-
-        self.zoom_slider = customtkinter.CTkSlider(self._cam_settings, from_=0.5, to=3.0, number_of_steps=25, command=self._on_zoom_change, width=160)
+        self.zoom_slider = customtkinter.CTkSlider(ctrl_row, from_=0.5, to=3.0, number_of_steps=25, command=self._on_zoom_change, width=100)
         self.zoom_slider.set(CAMERA_ZOOM)
-        self.zoom_slider.pack(side="left", padx=(0, 6))
+        self.zoom_slider.pack(side="left", padx=(0, 4))
 
-        self.zoom_label = customtkinter.CTkLabel(self._cam_settings, text=f"{CAMERA_ZOOM:.1f}x", font=(_FONT_PRIMARY[0], 12, "bold"), text_color=_CLR_ACCENT, width=42)
-        self.zoom_label.pack(side="left", padx=(0, 12))
+        self.zoom_label = customtkinter.CTkLabel(ctrl_row, text=f"{CAMERA_ZOOM:.1f}x", font=(_FONT_PRIMARY[0], 11, "bold"), text_color=_CLR_ACCENT, width=36)
+        self.zoom_label.pack(side="left", padx=(0, 6))
 
-        customtkinter.CTkButton(self._cam_settings, text="Simpan", command=self._save_camera_settings, font=(_FONT_PRIMARY[0], 11), fg_color=_CLR_ACCENT, hover_color=_CLR_ACCENT2, text_color=_CLR_TEXT, corner_radius=_CORNER_RADIUS_SMALL, height=30, width=80).pack(side="left")
+        customtkinter.CTkButton(ctrl_row, text="Simpan", command=self._save_camera_settings, font=(_FONT_PRIMARY[0], 10, "bold"), fg_color=_CLR_ACCENT, hover_color=_CLR_ACCENT2, text_color=_CLR_TEXT, corner_radius=_CORNER_RADIUS_SMALL, height=30, width=60).pack(side="left", padx=(0, 8))
+
+        self.detect_btn = customtkinter.CTkButton(ctrl_row, text="Tes Blok", command=self._test_block_detection, font=(_FONT_PRIMARY[0], 11, "bold"), fg_color=_CLR_SUCCESS, hover_color=_CLR_SUCCESS_HOVER, text_color=_CLR_TEXT, corner_radius=_CORNER_RADIUS_SMALL, height=34)
+        self.detect_btn.pack(side="right")
 
         # ── Main Action Button (bottom) ──────────────────────────────────────
         self.button = customtkinter.CTkButton(self._content, text="MULAI TES", command=self.button_callback, font=(_FONT_PRIMARY[0], 20, "bold"), fg_color=_CLR_ACCENT, hover_color=_CLR_ACCENT2, text_color=_CLR_TEXT, corner_radius=_CORNER_RADIUS, height=56)
@@ -1366,17 +1361,16 @@ class App_Input(customtkinter.CTk): #CTkToplevel
             fg_color=_CLR_BG if CAMERA_MIRROR_X else _CLR_CARD
         )
 
-    def _toggle_cam_settings(self):
-        if self._cam_settings.winfo_ismapped():
-            self._cam_settings.grid_remove()
-            self._gear_btn.configure(fg_color=_CLR_BG)
-        else:
-            self._cam_settings.grid()
-            self._gear_btn.configure(fg_color=_CLR_SUBTLE_BORDER)
+    def _toggle_mirror_y(self):
+        global CAMERA_MIRROR_Y
+        self._mirror_y_active = not self._mirror_y_active
+        CAMERA_MIRROR_Y = self._mirror_y_active
+        self._mirror_y_btn.configure(
+            fg_color=_CLR_BG if CAMERA_MIRROR_Y else _CLR_CARD
+        )
 
     def _on_mirror_change(self):
-        global CAMERA_MIRROR_Y
-        CAMERA_MIRROR_Y = self.mirror_y_var.get()
+        pass  # Kept for compatibility — mirror Y now uses toggle button
 
     def _on_zoom_change(self, value):
         global CAMERA_ZOOM
@@ -1456,10 +1450,10 @@ class App_Input(customtkinter.CTk): #CTkToplevel
                     continue
 
                 # Get actual label dimensions so preview fills the space
-                w = self.cam_preview_label.winfo_width()
-                h = self.cam_preview_label.winfo_height()
-                pw = max(w, 400) if w > 1 else 520
-                ph = max(h, 300) if h > 1 else 360
+                cw = self.cam_preview_label.winfo_width()
+                ch = self.cam_preview_label.winfo_height()
+                cw = max(cw, 400) if cw > 1 else 520
+                ch = max(ch, 300) if ch > 1 else 360
 
                 # ── QR Code detection (every 5 frames, BGR) ──────────────
                 _qframe += 1
@@ -1489,7 +1483,11 @@ class App_Input(customtkinter.CTk): #CTkToplevel
                         start_y = (new_h - h) // 2
                         frame = frame[start_y:start_y + h, start_x:start_x + w]
 
-                img = Image.fromarray(frame).resize((pw, ph), Image.LANCZOS)
+                # Aspect-ratio-preserving letterbox (like TimeIn)
+                h_f, w_f = frame.shape[:2]
+                scale = min(cw / w_f, ch / h_f)
+                nw, nh = int(w_f * scale), int(h_f * scale)
+                img = Image.fromarray(frame).resize((nw, nh), Image.LANCZOS)
                 self._current_imgtk = ImageTk.PhotoImage(img)
 
                 def upd(im=None):
