@@ -45,25 +45,23 @@ Window starts maximized with dark theme. Linux uses `attributes('-zoomed')`, oth
 
 | Var | Values | Default | Effect |
 |-----|--------|---------|--------|
-| `PC_MODE` | `competition` / `training` | `training` | Initial mode at startup. Can be toggled via UI (Latihan/Kompetisi buttons in title bar) — UI changes override this. |
-| `API_SERVER_URL` | URL or empty | (empty) | Empty = offline solo mode, no server calls |
-| `MODEL_BANTAL` | `true` / `false` | `false` | `true`: `MODEL/bantal/bantal.pt`. `false`: `MODEL/exp7/weights/best.pt` |
-| `NORMAL_PATTERN` | `true` / `false` | `false` | Switches between two `LEVEL_ANSWERS` dicts and `FILES/` subdirectories |
-| `MAX_LEVEL` | 1-8 | `8` | Number of levels per game session |
+| `PC_MODE` | `competition` / `training` | `training` | Startup default — bisa diganti via UI toggle |
+| `API_SERVER_URL` | URL or empty | (empty) | Empty = offline solo mode |
+| `MODEL_BANTAL` | `true` / `false` | `false` | `true`: `MODEL/bantal/bantal.pt` |
+| `NORMAL_PATTERN` | `true` / `false` | `true` | Switch `LEVEL_ANSWERS` + `FILES/` subdir |
+| `MAX_LEVEL` | 1-8 | `8` | Jumlah level |
 | `BUTTON_MODE` | `true` / `false` | `false` | Enable ESP32 serial button reader |
-| `DISPLAY_HALF` | `true` / `false` | `false` | Half-screen camera layout |
+| `DISPLAY_HALF` | `true` / `false` | `true` | Half-screen camera layout |
 | `HIDE_CAMERA` | `true` / `false` | `false` | Hide camera feed entirely |
-| `CUSTOM_LEVEL` | e.g. `1a,2b,3c` | (empty) | Override random level variant selection |
-| `CAMERA_INDEX` | integer | `0` | Camera device index for OpenCV |
-| `CAMERA_MIRROR_X` | `true` / `false` | `false` | Horizontal flip camera feed |
-| `CAMERA_MIRROR_Y` | `true` / `false` | `false` | Vertical flip camera feed |
-| `CAMERA_ZOOM` | float 0.5-3.0 | `1.0` | Camera zoom factor |
-| `DEBUG_MODE` | `true` / `false` | `false` | Print detailed performance metrics |
-| `THEME` | `dark` / `light` | `dark` | UI color theme (requires restart) |
-| `YOLO_SKIP_FRAMES` | integer | `2` | YOLO inference every N+1 frames |
-| `MEDIAPIPE_SKIP_FRAMES` | integer | `2` | MediaPipe skip count |
-| `ROOM_ID` | string | (empty) | Fallback room code (ignored when GUI lobby is used) |
-| `PLAYER_NUM` | 1 / 2 | (empty) | Fallback player number |
+| `CUSTOM_LEVEL` | e.g. `1a,2b,3c` | (empty) | Override random level variant |
+| `CAMERA_INDEX` | integer | `0` | Camera device index |
+| `CAMERA_MIRROR_X` | `true` / `false` | `true` | Horizontal flip |
+| `CAMERA_MIRROR_Y` | `true` / `false` | `false` | Vertical flip |
+| `CAMERA_ZOOM` | float 0.5-3.0 | `1.0` | Camera zoom |
+| `DEBUG_MODE` | `true` / `false` | `false` | Print performance metrics |
+| `THEME` | `dark` / `light` | `dark` | UI theme (restart needed) |
+| `YOLO_SKIP_FRAMES` | integer | `2` | YOLO every N+1 frames |
+| `MEDIAPIPE_SKIP_FRAMES` | integer | `2` | MediaPipe every N+1 frames |
 
 ## Architecture
 
