@@ -396,7 +396,7 @@ class GameWebSocket:
 
     def _run(self):
         try:
-            import websocket as _ws_mod
+            from websocket import WebSocketApp as _WSApp  # explicit websocket-client
         except ImportError:
             print(">>> [WS] websocket-client not installed, skipping WS connection")
             return
@@ -405,7 +405,7 @@ class GameWebSocket:
             try:
                 url = self._build_url()
                 print(f">>> [WS] Connecting to {url}")
-                ws = _ws_mod.WebSocketApp(
+                ws = _WSApp(
                     url,
                     on_open=self._on_open,
                     on_message=self._on_msg,
@@ -3049,9 +3049,6 @@ class TimeIn(customtkinter.CTk):
         self.start_timer()
 
     def button_0_callback(self):
-        # In competition, button is disabled — countdown triggered by WS match_start
-        if IS_MULTIPLAYER:
-            return
         self.button_0.grid_remove()
         self.show_current_level_button(self.current_question)
 
@@ -4533,13 +4530,16 @@ class App_Room(customtkinter.CTk):
         for w in self.room_list_frame.winfo_children():
             w.destroy()
         self.room_list_frame.grid_columnconfigure(0, weight=1)
-        if not rooms:
+        # Only show rooms that are still joinable (waiting or ready with <2 players)
+        active_rooms = [r for r in rooms if r.get("status") in ("waiting", "ready")
+                        and not r.get("player2_name")]
+        if not active_rooms:
             customtkinter.CTkLabel(
                 self.room_list_frame, text="Belum ada room",
                 font=(_FONT_PRIMARY[0], 13), text_color=_CLR_MUTED,
             ).grid(row=0, column=0, pady=24)
             return
-        for i, r in enumerate(rooms):
+        for i, r in enumerate(active_rooms):
             row = customtkinter.CTkFrame(
                 self.room_list_frame, fg_color=_CLR_BG, corner_radius=_CORNER_RADIUS_SMALL,
                 border_width=1, border_color=_CLR_SUBTLE_BORDER,
