@@ -2222,8 +2222,7 @@ class TimeIn(customtkinter.CTk):
         self._pending_match_result = None
         if IS_MULTIPLAYER:
             self.button_0.configure(text="⏳ Menunggu lawan...", state="disabled", fg_color=_CLR_CARD)
-            if _ws_client and _ws_client.connected:
-                _ws_client.send({"type": "player_ready", "player_id": f"P{PLAYER_NUM}", "player_num": PLAYER_NUM})
+            self.after(200, self._retry_send_ready)
 
         # Status bar (half display mode — shows level info) — Modern pill style
         if DISPLAY_HALF:
@@ -2432,6 +2431,24 @@ class TimeIn(customtkinter.CTk):
             on_message=self._on_ws_game_message,
         )
         _ws_client.connect()
+
+    def _retry_send_ready(self, _attempt=0):
+        """Send player_ready once WS is connected (retry every 300ms, max 10s)."""
+        if not IS_MULTIPLAYER:
+            return
+        if _ws_client and _ws_client.connected:
+            _ws_client.send({
+                "type": "player_ready",
+                "player_id": f"P{PLAYER_NUM}",
+                "player_num": PLAYER_NUM,
+            })
+            print(">>> [COMP] Sent player_ready for sync start")
+            return
+        if _attempt >= 33:  # ~10s timeout
+            print(">>> [COMP] WS connect timeout — falling back to local start")
+            self.button_0.configure(text="MULAI TES", state="normal", fg_color=_CLR_ACCENT)
+            return
+        self.after(300, lambda: self._retry_send_ready(_attempt + 1))
 
     def _on_ws_game_message(self, data: dict):
         try:
