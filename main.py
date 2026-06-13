@@ -379,12 +379,13 @@ class GameWebSocket:
         self._thread = None
 
     def _build_url(self):
+        from urllib.parse import quote
         base = API_SERVER_URL.replace("http://", "ws://").replace("https://", "wss://").rstrip("/")
         pid = f"P{self.player_num}"
         return (
-            f"{base}/ws/match/{self.room_code}"
+            f"{base}/ws/match/{quote(self.room_code, safe='')}"
             f"?role=player&player_id={pid}"
-            f"&player_name={self.player_name}"
+            f"&player_name={quote(self.player_name, safe='')}"
             f"&player_num={self.player_num}"
         )
 
