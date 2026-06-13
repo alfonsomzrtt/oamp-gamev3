@@ -2789,6 +2789,9 @@ class TimeIn(customtkinter.CTk):
             font=(_FONT_PRIMARY[0], 13), text_color=_CLR_MUTED,
         ).grid(row=3, column=0, pady=(0, 16))
 
+        # Determine mode first before checking is_duel
+        is_duel = CURRENT_MODE == "competition" or TOURNAMENT_MODE
+
         # PROMINENT WIN/LOSE banner (competition mode) — shown right after trophy
         if is_duel:
             winlose_frame = customtkinter.CTkFrame(
@@ -2811,7 +2814,6 @@ class TimeIn(customtkinter.CTk):
             self._winlose_label.grid(row=0, column=0, pady=18)
 
         # Stats row
-        is_duel = CURRENT_MODE == "competition" or TOURNAMENT_MODE
         stats = customtkinter.CTkFrame(self.results_frame, fg_color="transparent")
         stats.grid(row=4, column=0, sticky="ew", padx=20, pady=(0, 12))
 
