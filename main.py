@@ -1934,9 +1934,10 @@ class TimeIn(customtkinter.CTk):
             # Half display mode (4:1 ratio for top:bottom)
             self.grid_rowconfigure(0, weight=4)  # Top part (larger portion)
             self.grid_rowconfigure(1, weight=1)  # Bottom part (smaller portion)
+            self.grid_rowconfigure(2, weight=0)  # Action bar (fixed height)
             self.grid_columnconfigure(0, weight=1)
             self.grid_columnconfigure(1, weight=1)
-            
+
             # Create a container for the top half
             self.top_container = customtkinter.CTkFrame(self, fg_color=_CLR_BG)
             self.top_container.grid(row=0, column=0, columnspan=2, sticky="nsew", pady=(0, 4))
@@ -1944,7 +1945,7 @@ class TimeIn(customtkinter.CTk):
             self.top_container.grid_columnconfigure(1, weight=1)
             self.top_container.grid_rowconfigure(0, weight=1)
             self.top_container.grid_rowconfigure(1, weight=0)  # For the button row
-            
+
             # Content container for half display
             self.content_container = customtkinter.CTkFrame(self.top_container, fg_color=_CLR_BG)
             self.content_container.grid(row=0, column=0, columnspan=2, sticky="nsew")
@@ -1952,18 +1953,19 @@ class TimeIn(customtkinter.CTk):
             self.content_container.grid_columnconfigure(1, weight=1)
             self.content_container.grid_rowconfigure(0, weight=1)
         else:
-            # Full display mode (use full window)
-            self.grid_rowconfigure(0, weight=1)
+            # Full display mode
+            self.grid_rowconfigure(0, weight=1)  # Main content
+            self.grid_rowconfigure(1, weight=0)  # Action bar (fixed height)
             self.grid_columnconfigure(0, weight=1)
             self.grid_columnconfigure(1, weight=1)
-            
+
             # Main container for full display
             self.top_container = customtkinter.CTkFrame(self, fg_color=_CLR_BG)
             self.top_container.grid(row=0, column=0, columnspan=2, sticky="nsew", padx=10, pady=10)
             self.top_container.grid_columnconfigure(0, weight=1)
             self.top_container.grid_columnconfigure(1, weight=1)
             self.top_container.grid_rowconfigure(0, weight=1)
-            
+
             # Content container for full display
             self.content_container = customtkinter.CTkFrame(self.top_container, fg_color=_CLR_BG)
             self.content_container.grid(row=0, column=0, columnspan=2, sticky="nsew")
@@ -2215,6 +2217,14 @@ class TimeIn(customtkinter.CTk):
             # In full mode, place the button at the bottom of the left panel
             self.button_0.grid(row=2, column=0, columnspan=2, padx=20, pady=button_pady, sticky="ew")
 
+        # Competition mode: auto-sync start via WS (no manual MULAI TES)
+        self._pending_match_start = False
+        self._pending_match_result = None
+        if IS_MULTIPLAYER:
+            self.button_0.configure(text="⏳ Menunggu lawan...", state="disabled", fg_color=_CLR_CARD)
+            if _ws_client and _ws_client.connected:
+                _ws_client.send({"type": "player_ready", "player_id": f"P{PLAYER_NUM}", "player_num": PLAYER_NUM})
+
         # Status bar (half display mode — shows level info) — Modern pill style
         if DISPLAY_HALF:
             self.bottom_container = customtkinter.CTkFrame(
@@ -2229,6 +2239,19 @@ class TimeIn(customtkinter.CTk):
                 font=(_FONT_PRIMARY[0], 12, "bold"), text_color=_CLR_ACCENT, anchor="w",
             )
             self.status_label.pack(side="left", padx=20, pady=8)
+
+        # Results action bar — pinned to bottom of window, always visible
+        # Populated by _build_results_dashboard, hidden otherwise
+        self._action_bar_built = False
+        self.results_action_bar = customtkinter.CTkFrame(
+            self, fg_color=_CLR_CARD, height=72,
+            border_width=1, border_color=_CLR_SUBTLE_BORDER,
+        )
+        # Row placement: half mode → row 2 (below bottom_container), full mode → row 1
+        action_row = 2 if DISPLAY_HALF else 1
+        self.results_action_bar.grid(row=action_row, column=0, columnspan=2, sticky="ew")
+        self.results_action_bar.grid_propagate(False)
+        self.results_action_bar.grid_remove()
 
         #self.start_zero = time.time()
         #self.start_thumb = time.time()
@@ -2426,7 +2449,7 @@ class TimeIn(customtkinter.CTk):
                 _opponent_level = data.get("game_score", _opponent_level)
                 _opponent_blocks = data.get("blocks_hit", _opponent_blocks)
                 _opponent_name = data.get("player_name", _opponent_name or "Lawan")
-                self._update_opponent_badge()
+                self.after(0, self._update_opponent_badge)
 
         elif msg_type == "level_start":
             opp_num = data.get("player_num", 0)
@@ -2434,7 +2457,7 @@ class TimeIn(customtkinter.CTk):
                 _opponent_level = data.get("level", _opponent_level)
                 _opponent_blocks = 0  # reset time for new level
                 _opponent_name = data.get("player_name", _opponent_name or "Lawan")
-                self._update_opponent_badge()
+                self.after(0, self._update_opponent_badge)
 
         elif msg_type == "GAME_OVER":
             opp_num = data.get("player_num", 0)
@@ -2442,18 +2465,20 @@ class TimeIn(customtkinter.CTk):
                 _opponent_finished = True
                 _opponent_name = data.get("player_name", "Lawan")
                 self._update_opponent_badge()
-                self._show_opponent_finished_banner()
+                self.after(0, self._show_opponent_finished_banner)
 
         elif msg_type == "match_start":
-            pass  # Game is already running via local countdown
+            if IS_MULTIPLAYER:
+                self._pending_match_start = True
+                self._try_start_competition()
 
         elif msg_type == "match_result":
-            # Instant winner notification — will also arrive via REST polling
             winner = data.get("winner", "")
             p1s = data.get("p1_score", 0)
             p2s = data.get("p2_score", 0)
             if winner:
-                self._show_match_result_banner(winner, p1s, p2s)
+                self._pending_match_result = (winner, p1s, p2s)
+                self.after(0, lambda w=winner, a=p1s, b=p2s: self._show_match_result_banner(w, a, b))
 
     def _update_opponent_badge(self):
         if not IS_MULTIPLAYER:
@@ -2491,6 +2516,8 @@ class TimeIn(customtkinter.CTk):
         self._update_opponent_badge()
         # Update the duel result UI if it exists
         if not hasattr(self, '_duel_result_label') or self._duel_result_label is None:
+            # Labels not yet created (results dashboard not built) — stash for later
+            self._pending_match_result = (winner, p1_score, p2_score)
             return
         my_num = str(PLAYER_NUM)
         try:
@@ -2794,25 +2821,36 @@ class TimeIn(customtkinter.CTk):
                 self._duel_p1_score_label = p1_score_label
                 self._duel_p2_score_label = p2_score_label
 
+                # Apply pending match_result that arrived before dashboard was built
+                if self._pending_match_result:
+                    w, p1s, p2s = self._pending_match_result
+                    self._pending_match_result = None
+                    self._show_match_result_banner(w, p1s, p2s)
+
                 def _on_duel_result(decided, data):
-                    try:
-                        if decided and data.get("winner"):
-                            w = data["winner"]
-                            my_num = str(PLAYER_NUM)
-                            p1s = f"P1: {data.get('player1_score', '--')}"
-                            p2s = f"P2: {data.get('player2_score', '--')}"
-                            p1_score_label.configure(text=p1s)
-                            p2_score_label.configure(text=p2s)
-                            if w == "draw":
-                                duel_label.configure(text="SERI!", text_color=_CLR_ACCENT)
-                            elif w == my_num:
-                                duel_label.configure(text="🏆 KAMU MENANG!", text_color="#22c55e")
+                    def _apply():
+                        try:
+                            if decided and data.get("winner"):
+                                w = data["winner"]
+                                my_num = str(PLAYER_NUM)
+                                p1s = f"P1: {data.get('player1_score', '--')}"
+                                p2s = f"P2: {data.get('player2_score', '--')}"
+                                p1_score_label.configure(text=p1s)
+                                p2_score_label.configure(text=p2s)
+                                if w == "draw":
+                                    duel_label.configure(text="SERI!", text_color=_CLR_ACCENT)
+                                elif w == my_num:
+                                    duel_label.configure(text="🏆 KAMU MENANG!", text_color="#22c55e")
+                                else:
+                                    duel_label.configure(text="KAMU KALAH", text_color="#ef4444")
                             else:
-                                duel_label.configure(text="KAMU KALAH", text_color="#ef4444")
-                        else:
-                            duel_label.configure(text="Hasil tidak tersedia", text_color=_CLR_MUTED)
+                                duel_label.configure(text="Hasil tidak tersedia", text_color=_CLR_MUTED)
+                        except Exception:
+                            pass
+                    try:
+                        self.after(0, _apply)
                     except Exception:
-                        pass
+                        _apply()
                 _poll_duel_result(CURRENT_ROOM_CODE, callback=_on_duel_result)
             else:
                 # Tournament mode — show match finished status
@@ -2857,34 +2895,35 @@ class TimeIn(customtkinter.CTk):
                     text_color=_CLR_TEXT, width=50,
                 ).grid(row=0, column=2, padx=(6, 0))
 
-        # Buttons
-        btn_frame = customtkinter.CTkFrame(self.results_frame, fg_color="transparent")
-        btn_frame.grid(row=7 + len(self.timer_task_all) if self.timer_task_all else 7, column=0, sticky="ew", padx=20, pady=(16, 8))
-        btn_frame.grid_columnconfigure(0, weight=1)
-        btn_frame.grid_columnconfigure(1, weight=1)
-        btn_frame.grid_columnconfigure(2, weight=1)
-
-        customtkinter.CTkButton(
-            btn_frame, text="Main Lagi",
-            font=(_FONT_PRIMARY[0], 14, "bold"),
-            fg_color=_CLR_ACCENT, hover_color=_CLR_ACCENT2,
-            text_color=_CLR_TEXT, corner_radius=_CORNER_RADIUS, height=52,
-            command=self.retry_test,
-        ).grid(row=0, column=0, padx=(0, 4), sticky="ew")
-        customtkinter.CTkButton(
-            btn_frame, text="Salin Hasil",
-            font=(_FONT_PRIMARY[0], 14, "bold"),
-            fg_color=_CLR_CARD, hover_color=_CLR_SUBTLE_BORDER,
-            text_color=_CLR_TEXT, corner_radius=_CORNER_RADIUS, height=52,
-            command=lambda: self._copy_results(total_time, age_real),
-        ).grid(row=0, column=1, padx=4, sticky="ew")
-        customtkinter.CTkButton(
-            btn_frame, text="✕ Ganti Peserta",
-            font=(_FONT_PRIMARY[0], 14, "bold"),
-            fg_color=_CLR_DANGER, hover_color=_CLR_DANGER_HOVER,
-            text_color=_CLR_TEXT, corner_radius=_CORNER_RADIUS, height=52,
-            command=self._switch_player,
-        ).grid(row=0, column=2, padx=(4, 0), sticky="ew")
+        # Action buttons — pinned to bottom of window in persistent results_action_bar
+        # (not in scrollable frame, so always visible)
+        if not self._action_bar_built:
+            for c in self.results_action_bar.winfo_children():
+                c.destroy()
+            self.results_action_bar.grid_columnconfigure((0, 1, 2), weight=1)
+            customtkinter.CTkButton(
+                self.results_action_bar, text="Main Lagi",
+                font=(_FONT_PRIMARY[0], 14, "bold"),
+                fg_color=_CLR_ACCENT, hover_color=_CLR_ACCENT2,
+                text_color=_CLR_TEXT, corner_radius=_CORNER_RADIUS, height=52,
+                command=self.retry_test,
+            ).grid(row=0, column=0, padx=(16, 4), pady=10, sticky="ew")
+            customtkinter.CTkButton(
+                self.results_action_bar, text="Salin Hasil",
+                font=(_FONT_PRIMARY[0], 14, "bold"),
+                fg_color=_CLR_CARD, hover_color=_CLR_SUBTLE_BORDER,
+                text_color=_CLR_TEXT, corner_radius=_CORNER_RADIUS, height=52,
+                command=lambda: self._copy_results(total_time, age_real),
+            ).grid(row=0, column=1, padx=4, pady=10, sticky="ew")
+            customtkinter.CTkButton(
+                self.results_action_bar, text="✕ Ganti Peserta",
+                font=(_FONT_PRIMARY[0], 14, "bold"),
+                fg_color=_CLR_DANGER, hover_color=_CLR_DANGER_HOVER,
+                text_color=_CLR_TEXT, corner_radius=_CORNER_RADIUS, height=52,
+                command=self._switch_player,
+            ).grid(row=0, column=2, padx=(4, 16), pady=10, sticky="ew")
+            self._action_bar_built = True
+        self.results_action_bar.grid()
 
     def _copy_results(self, total_time, age_real):
         """Copy results to clipboard."""
@@ -2955,6 +2994,18 @@ class TimeIn(customtkinter.CTk):
             if on_done:
                 on_done()
 
+    def _try_start_competition(self):
+        """Competition: start countdown once both players are loaded (WS match_start received)."""
+        if not IS_MULTIPLAYER:
+            return
+        if not getattr(self, '_pending_match_start', False):
+            return
+        self._pending_match_start = False
+        self.button_0.grid_remove()
+        self.show_current_level_button(self.current_question)
+        play_sfx('countdown')
+        self._show_countdown(count=3, on_done=self._start_game)
+
     def _start_game(self):
         """Actual game start after countdown."""
         variant = self.get_random_variant(self.current_question)
@@ -2980,18 +3031,16 @@ class TimeIn(customtkinter.CTk):
         self.start_timer()
 
     def button_0_callback(self):
+        # In competition, button is disabled — countdown triggered by WS match_start
+        if IS_MULTIPLAYER:
+            return
         self.button_0.grid_remove()
         self.show_current_level_button(self.current_question)
 
         play_sfx('countdown')
         print("START")
 
-        if IS_MULTIPLAYER:
-            # In competition: show local countdown, send player_ready
-            # The backend will broadcast match_start to both players
-            self._show_countdown(count=3, on_done=self._start_game)
-        else:
-            self._show_countdown(count=3, on_done=self._start_game)
+        self._show_countdown(count=3, on_done=self._start_game)
 
     #def button_1_callback(self):
 
