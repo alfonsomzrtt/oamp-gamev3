@@ -1269,7 +1269,7 @@ class App_Input(customtkinter.CTk): #CTkToplevel
 
     def _on_close(self):
         self._preview_running = False
-        raise SystemExit(0)
+        self.destroy()
 
     def destroy(self):
         self._preview_running = False
@@ -2545,12 +2545,20 @@ class TimeIn(customtkinter.CTk):
                 self._duel_p1_score_label.configure(text=p1s)
             if hasattr(self, '_duel_p2_score_label') and self._duel_p2_score_label:
                 self._duel_p2_score_label.configure(text=p2s)
+            # Determine win/lose text + color
             if winner == "draw":
-                self._duel_result_label.configure(text="SERI!", text_color=_CLR_ACCENT)
+                result_text = "🤝 SERI!"
+                result_color = _CLR_ACCENT
             elif winner == my_num:
-                self._duel_result_label.configure(text="🏆 KAMU MENANG!", text_color="#22c55e")
+                result_text = "🏆 KAMU MENANG!"
+                result_color = "#22c55e"
             else:
-                self._duel_result_label.configure(text="KAMU KALAH", text_color="#ef4444")
+                result_text = "KAMU KALAH"
+                result_color = "#ef4444"
+            self._duel_result_label.configure(text=result_text, text_color=result_color)
+            # Update prominent win/lose banner too
+            if hasattr(self, '_winlose_label') and self._winlose_label is not None:
+                self._winlose_label.configure(text=result_text, text_color=result_color)
         except Exception:
             pass
 
@@ -2714,8 +2722,13 @@ class TimeIn(customtkinter.CTk):
         self.design_frame_1.grid_remove()
         self.level_badge_frame.grid_remove()
         self.star_frame.grid_remove()
-        self._exit_btn.place_forget()
+        # Hide "Set" button (inside video_frame_0) so it doesn't compete with action bar
+        if self.video_frame_0 is not None:
+            self.video_frame_0.grid_remove()
+        # Hide results frame first, action bar — shown later
         self.results_frame.grid()
+        # Re-show the ✕ Keluar button at top-right so user has clear exit from results
+        self._exit_btn.place(relx=1.0, rely=0.0, anchor="ne", x=-12, y=8)
 
         # Clear previous results
         for w in self.results_frame.winfo_children():
@@ -2776,10 +2789,31 @@ class TimeIn(customtkinter.CTk):
             font=(_FONT_PRIMARY[0], 13), text_color=_CLR_MUTED,
         ).grid(row=3, column=0, pady=(0, 16))
 
+        # PROMINENT WIN/LOSE banner (competition mode) — shown right after trophy
+        if is_duel:
+            winlose_frame = customtkinter.CTkFrame(
+                self.results_frame, fg_color=_CLR_BG, corner_radius=_CORNER_RADIUS,
+                border_width=2, border_color="#22c55e",
+            )
+            winlose_frame.grid(row=3, column=0, sticky="ew", padx=20, pady=(0, 16))
+            winlose_frame.grid_columnconfigure(0, weight=1)
+            # Initialize with waiting text — _show_match_result_banner updates this
+            winlose_text = "⏳ Menunggu hasil lawan..."
+            winlose_color = _CLR_ACCENT
+            if not IS_MULTIPLAYER or not CURRENT_ROOM_CODE:
+                # Solo or no room — no duel result
+                winlose_text = "Mode Latihan"
+                winlose_color = _CLR_MUTED
+            self._winlose_label = customtkinter.CTkLabel(
+                winlose_frame, text=winlose_text,
+                font=(_FONT_PRIMARY[0], 22, "bold"), text_color=winlose_color,
+            )
+            self._winlose_label.grid(row=0, column=0, pady=18)
+
         # Stats row
         is_duel = CURRENT_MODE == "competition" or TOURNAMENT_MODE
         stats = customtkinter.CTkFrame(self.results_frame, fg_color="transparent")
-        stats.grid(row=3, column=0, sticky="ew", padx=20, pady=(0, 12))
+        stats.grid(row=4, column=0, sticky="ew", padx=20, pady=(0, 12))
 
         if is_duel:
             # Duel mode: show age + total time only
@@ -2856,11 +2890,15 @@ class TimeIn(customtkinter.CTk):
                                 p1_score_label.configure(text=p1s)
                                 p2_score_label.configure(text=p2s)
                                 if w == "draw":
-                                    duel_label.configure(text="SERI!", text_color=_CLR_ACCENT)
+                                    rtext, rcolor = "🤝 SERI!", _CLR_ACCENT
                                 elif w == my_num:
-                                    duel_label.configure(text="🏆 KAMU MENANG!", text_color="#22c55e")
+                                    rtext, rcolor = "🏆 KAMU MENANG!", "#22c55e"
                                 else:
-                                    duel_label.configure(text="KAMU KALAH", text_color="#ef4444")
+                                    rtext, rcolor = "KAMU KALAH", "#ef4444"
+                                duel_label.configure(text=rtext, text_color=rcolor)
+                                # Update prominent win/lose banner
+                                if hasattr(self, '_winlose_label') and self._winlose_label is not None:
+                                    self._winlose_label.configure(text=rtext, text_color=rcolor)
                             else:
                                 duel_label.configure(text="Hasil tidak tersedia", text_color=_CLR_MUTED)
                         except Exception:
