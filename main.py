@@ -69,7 +69,7 @@ HIDE_CAMERA = os.getenv('HIDE_CAMERA', 'false').lower() == 'true'
 
 # Camera settings
 CAMERA_INDEX = int(os.getenv('CAMERA_INDEX', '0'))
-CAMERA_MIRROR_X = os.getenv('CAMERA_MIRROR_X', 'true').lower() == 'true'
+CAMERA_MIRROR_X = os.getenv('CAMERA_MIRROR_X', 'false').lower() == 'true'
 CAMERA_MIRROR_Y = os.getenv('CAMERA_MIRROR_Y', 'false').lower() == 'true'
 try:
     CAMERA_ZOOM = float(os.getenv('CAMERA_ZOOM', '1.0'))
@@ -77,6 +77,11 @@ try:
         CAMERA_ZOOM = 1.0
 except (ValueError, TypeError):
     CAMERA_ZOOM = 1.0
+
+CAMERA_BRIGHTNESS = int(os.getenv('CAMERA_BRIGHTNESS', '128'))
+CAMERA_CONTRAST = int(os.getenv('CAMERA_CONTRAST', '128'))
+CAMERA_SATURATION = int(os.getenv('CAMERA_SATURATION', '128'))
+CAMERA_CALIBRATION = os.getenv('CAMERA_CALIBRATION', 'false').lower() == 'true'
 
 
 def _enumerate_cameras(max_index=5):
@@ -97,6 +102,37 @@ def _enumerate_cameras(max_index=5):
         except Exception:
             pass
     return available
+
+
+# SAFE camera properties that can be written to hardware.
+# Writing to other properties (brightness, contrast, saturation, etc.)
+# persists in the camera driver across app restarts — DO NOT ADD THEM.
+_SAFE_CAP_PROPS = {cv2.CAP_PROP_FRAME_WIDTH, cv2.CAP_PROP_FRAME_HEIGHT}
+
+
+def _cap_set(prop, value):
+    """Write to camera hardware — only safe properties allowed."""
+    if prop not in _SAFE_CAP_PROPS:
+        import warnings
+        warnings.warn(f"BLOCKED: cap.set({prop}, {value}) writes to camera hardware and persists!"
+                      f" Use _apply_software_calibration() instead. Prop {prop} is not in safe list.")
+        return False
+    return cap.set(prop, value) if cap is not None else False
+
+
+def _apply_software_calibration(frame, brightness, contrast, saturation):
+    """Apply brightness/contrast/saturation as software filters (no hardware writes)."""
+    import cv2 as _cv2
+    import numpy as _np
+    if contrast != 128 or brightness != 128:
+        alpha = contrast / 128.0
+        beta = brightness - 128
+        frame = _cv2.convertScaleAbs(frame, alpha=alpha, beta=beta)
+    if saturation != 128:
+        hsv = _cv2.cvtColor(frame, _cv2.COLOR_RGB2HSV)
+        hsv[:, :, 1] = _np.clip(hsv[:, :, 1].astype(_np.float32) * (saturation / 128.0), 0, 255).astype(_np.uint8)
+        frame = _cv2.cvtColor(hsv, _cv2.COLOR_HSV2RGB)
+    return frame
 
 
 def _save_env_value(key, value):
@@ -1177,6 +1213,7 @@ class App_Input(customtkinter.CTk): #CTkToplevel
         cam_card.grid_rowconfigure(1, weight=0)     # hint row
         cam_card.grid_rowconfigure(2, weight=0)     # detection result
         cam_card.grid_rowconfigure(3, weight=0)     # controls
+        cam_card.grid_rowconfigure(4, weight=0)     # calibration
 
         self.cam_preview_label = customtkinter.CTkLabel(cam_card, text="Memulai kamera...", font=(_FONT_PRIMARY[0], 13), text_color=_CLR_MUTED, fg_color="#111111", corner_radius=_CORNER_RADIUS)
         self.cam_preview_label.grid(row=0, column=0, sticky="nsew", padx=12, pady=(12, 0))
@@ -1226,6 +1263,48 @@ class App_Input(customtkinter.CTk): #CTkToplevel
 
         self.detect_btn = customtkinter.CTkButton(ctrl_row, text="Tes Blok", command=self._test_block_detection, font=(_FONT_PRIMARY[0], 11, "bold"), fg_color=_CLR_SUCCESS, hover_color=_CLR_SUCCESS_HOVER, text_color=_CLR_TEXT, corner_radius=_CORNER_RADIUS_SMALL, height=34)
         self.detect_btn.pack(side="right")
+
+        # ── Calibration Section ─────────────────────────────────────────────
+        self._calib_section = customtkinter.CTkFrame(cam_card, fg_color="transparent")
+        self._calib_section.grid(row=4, column=0, sticky="ew", padx=12, pady=(0, 8))
+        self._calib_section.grid_columnconfigure(0, weight=1)
+
+        self._calib_var = customtkinter.BooleanVar(value=CAMERA_CALIBRATION)
+        self._calib_chk = customtkinter.CTkCheckBox(
+            self._calib_section, text="Kalibrasi Kamera",
+            variable=self._calib_var, command=self._on_calib_toggle,
+            font=(_FONT_PRIMARY[0], 11, "bold"), fg_color=_CLR_ACCENT, hover_color=_CLR_ACCENT2,
+        )
+        self._calib_chk.grid(row=0, column=0, sticky="w", pady=(0, 6))
+
+        self._img_quality_frame = customtkinter.CTkFrame(self._calib_section, fg_color="transparent")
+        self._img_quality_frame.grid(row=1, column=0, sticky="ew")
+        for ci, (label, attr, val) in enumerate([
+            ("Kecerahan", "brightness", CAMERA_BRIGHTNESS),
+            ("Kontras", "contrast", CAMERA_CONTRAST),
+            ("Saturasi", "saturation", CAMERA_SATURATION),
+        ]):
+            self._img_quality_frame.grid_columnconfigure(ci * 3, weight=0)
+            self._img_quality_frame.grid_columnconfigure(ci * 3 + 1, weight=1)
+            customtkinter.CTkLabel(
+                self._img_quality_frame, text=label,
+                font=(_FONT_PRIMARY[0], 10, "bold"), text_color=_CLR_MUTED,
+            ).grid(row=0, column=ci * 3, padx=(0 if ci == 0 else 8, 4))
+            s = customtkinter.CTkSlider(
+                self._img_quality_frame, from_=0, to=255, number_of_steps=255,
+                width=80, command=lambda v, a=attr: self._on_quality_slider(a, v),
+            )
+            s.set(val)
+            s.grid(row=0, column=ci * 3 + 1, sticky="ew")
+            setattr(self, f"_slider_{attr}", s)
+            lbl = customtkinter.CTkLabel(
+                self._img_quality_frame, text=str(val),
+                font=(_FONT_PRIMARY[0], 10, "bold"), text_color=_CLR_ACCENT, width=28,
+            )
+            lbl.grid(row=0, column=ci * 3 + 2, padx=(4, 0))
+            setattr(self, f"_slider_{attr}_label", lbl)
+        # Disable sliders if calibration is off
+        self._set_calib_sliders_state()
 
         # ── Main Action Button (bottom) ──────────────────────────────────────
         self.button = customtkinter.CTkButton(self._content, text="MULAI TES", command=self.button_callback, font=(_FONT_PRIMARY[0], 20, "bold"), fg_color=_CLR_ACCENT, hover_color=_CLR_ACCENT2, text_color=_CLR_TEXT, corner_radius=_CORNER_RADIUS, height=56)
@@ -1354,8 +1433,8 @@ class App_Input(customtkinter.CTk): #CTkToplevel
             cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
         else:
             cap = cv2.VideoCapture(idx)
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        _cap_set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        _cap_set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
         print(f">>> Camera switched to index {idx}")
 
     def _toggle_mirror_x(self):
@@ -1386,11 +1465,40 @@ class App_Input(customtkinter.CTk): #CTkToplevel
         self.zoom_slider.set(value)
         self._on_zoom_change(value)
 
+    def _on_calib_toggle(self):
+        global CAMERA_CALIBRATION
+        CAMERA_CALIBRATION = self._calib_var.get()
+        self._set_calib_sliders_state()
+
+    def _set_calib_sliders_state(self):
+        calib_on = self._calib_var.get()
+        for attr in ("brightness", "contrast", "saturation"):
+            s = getattr(self, f"_slider_{attr}", None)
+            if s:
+                s.configure(state="normal" if calib_on else "disabled")
+
+    def _on_quality_slider(self, attr, value):
+        global CAMERA_BRIGHTNESS, CAMERA_CONTRAST, CAMERA_SATURATION
+        val = int(round(value))
+        lbl = getattr(self, f"_slider_{attr}_label", None)
+        if lbl:
+            lbl.configure(text=str(val))
+        if attr == "brightness":
+            CAMERA_BRIGHTNESS = val
+        elif attr == "contrast":
+            CAMERA_CONTRAST = val
+        elif attr == "saturation":
+            CAMERA_SATURATION = val
+
     def _save_camera_settings(self):
         _save_env_value('CAMERA_INDEX', str(CAMERA_INDEX))
         _save_env_value('CAMERA_MIRROR_X', str(CAMERA_MIRROR_X).lower())
         _save_env_value('CAMERA_MIRROR_Y', str(CAMERA_MIRROR_Y).lower())
         _save_env_value('CAMERA_ZOOM', str(CAMERA_ZOOM))
+        _save_env_value('CAMERA_CALIBRATION', str(self._calib_var.get()).lower())
+        _save_env_value('CAMERA_BRIGHTNESS', str(int(round(self._slider_brightness.get()))))
+        _save_env_value('CAMERA_CONTRAST', str(int(round(self._slider_contrast.get()))))
+        _save_env_value('CAMERA_SATURATION', str(int(round(self._slider_saturation.get()))))
         import tkinter.messagebox as mb
         mb.showinfo("Tersimpan", "Pengaturan kamera disimpan ke .env")
 
@@ -1451,6 +1559,10 @@ class App_Input(customtkinter.CTk): #CTkToplevel
                         start_x = (new_w - w) // 2
                         start_y = (new_h - h) // 2
                         frame = frame[start_y:start_y + h, start_x:start_x + w]
+
+                # ── Software calibration (brightness/contrast/saturation) ──
+                if CAMERA_CALIBRATION:
+                    frame = _apply_software_calibration(frame, CAMERA_BRIGHTNESS, CAMERA_CONTRAST, CAMERA_SATURATION)
 
                 # ── Block detection overlay (when test active) ──────────
                 if self._block_test_active:
@@ -1690,8 +1802,11 @@ if _platform_mod.system() == 'Windows':
     cap = cv2.VideoCapture(CAMERA_INDEX, cv2.CAP_DSHOW)
 else:
     cap = cv2.VideoCapture(CAMERA_INDEX)
-cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+_cap_set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+_cap_set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+# WARNING: brightness/contrast/saturation are SOFTWARE filters in _preview_loop / streaming()
+# Never use cap.set() for those — they persist in camera driver across app restarts!
+
 
 print(">>> Start Test ...")
 
@@ -2129,16 +2244,6 @@ class TimeIn(customtkinter.CTk):
             
             self.video_frame_0 = TextFrame(self.content_container, "Upper Table Camera")
             self.video_frame_0.grid(row=0, column=1, padx=camera_padx, pady=0, sticky="nsew")
-
-            # Camera settings button (top-right of video frame)
-            self.camera_settings_btn = customtkinter.CTkButton(
-                self.video_frame_0, text="Set",
-                font=(_FONT_PRIMARY[0], 10, "bold"), width=40, height=32,
-                fg_color=_CLR_SUBTLE_BORDER, hover_color=_CLR_ACCENT,
-                text_color=_CLR_TEXT,
-                corner_radius=_CORNER_RADIUS_SMALL, command=self._open_camera_settings
-            )
-            self.camera_settings_btn.grid(row=0, column=2, padx=(0, 10), pady=(10, 0))
 
             self.video_frame_1 = ImageFrame(self.content_container, "", border_width=3, border_color=_CLR_BORDER)
             self.video_frame_1.grid(row=0, column=1, padx=camera_padx, pady=camera_pady, sticky="nsew")
@@ -3356,6 +3461,10 @@ class TimeIn(customtkinter.CTk):
                 start_y = (new_h - h) // 2
                 frame = frame[start_y:start_y+h, start_x:start_x+w]
 
+        # Software calibration (brightness/contrast/saturation) — no hardware writes
+        if CAMERA_CALIBRATION:
+            frame = _apply_software_calibration(frame, CAMERA_BRIGHTNESS, CAMERA_CONTRAST, CAMERA_SATURATION)
+
         # Handle button mode image visibility
         self.handle_button_mode()
         # Don't resize to 1000x800, use original resolution for better performance
@@ -4057,247 +4166,6 @@ class TimeIn(customtkinter.CTk):
             _ws_client = None
         self.cleanup()
         self.destroy()
-
-    def _open_camera_settings(self):
-        """Open camera settings dialog"""
-        dialog = CameraSettingsDialog(self)
-
-    def _update_camera_settings(self, mirror_x, mirror_y, zoom):
-        """Apply camera settings and save to .env"""
-        global CAMERA_MIRROR_X, CAMERA_MIRROR_Y, CAMERA_ZOOM
-        CAMERA_MIRROR_X = mirror_x
-        CAMERA_MIRROR_Y = mirror_y
-        CAMERA_ZOOM = zoom
-
-        # Save to .env
-        env_path = Path('.') / '.env'
-        lines = []
-        if env_path.exists():
-            with open(env_path, 'r') as f:
-                lines = f.readlines()
-
-        updates = {
-            'CAMERA_MIRROR_X': str(mirror_x).lower(),
-            'CAMERA_MIRROR_Y': str(mirror_y).lower(),
-            'CAMERA_ZOOM': str(zoom),
-        }
-
-        updated_lines = []
-        for line in lines:
-            stripped = line.strip()
-            prefix = stripped.split('=')[0] if '=' in stripped else ''
-            if prefix in updates:
-                updated_lines.append(f"{prefix}={updates[prefix]}\n")
-            else:
-                updated_lines.append(line)
-
-        existing_prefixes = {l.split('=')[0] for l in updated_lines if '=' in l}
-        for key, val in updates.items():
-            if key not in existing_prefixes:
-                updated_lines.append(f"{key}={val}\n")
-
-        with open(env_path, 'w') as f:
-            f.writelines(updated_lines)
-
-
-class CameraSettingsDialog(customtkinter.CTkToplevel):
-    """Camera settings dialog with live preview, mirror X/Y and zoom controls"""
-
-    def __init__(self, parent):
-        super().__init__(parent)
-        self.title("Pengaturan Kamera")
-        self.configure(fg_color=_CLR_BG)
-        self.resizable(0, 0)
-
-        # Center over parent window
-        self.update_idletasks()
-        px = parent.winfo_x() + (parent.winfo_width() // 2) - 180
-        py = parent.winfo_y() + (parent.winfo_height() // 2) - 200
-        self.geometry(f"380x440+{px}+{py}")
-
-        self.mirror_x = CAMERA_MIRROR_X
-        self.mirror_y = CAMERA_MIRROR_Y
-        self.zoom = CAMERA_ZOOM
-        self.running = True
-
-        self.transient(parent)
-        self.grab_set()
-
-        self.grid_columnconfigure(0, weight=1)
-
-        # ── Camera Preview ──────────────────────────────────────────────
-        preview_card = customtkinter.CTkFrame(self, fg_color=_CLR_CARD, corner_radius=_CORNER_RADIUS, border_width=1, border_color=_CLR_SUBTLE_BORDER)
-        preview_card.grid(row=0, column=0, padx=24, pady=(20, 10), sticky="ew")
-        preview_card.grid_columnconfigure(0, weight=1)
-        self.preview_label = customtkinter.CTkLabel(preview_card, text="", corner_radius=_CORNER_RADIUS_SMALL)
-        self.preview_label.grid(row=0, column=0, padx=4, pady=4, sticky="ew")
-        self.preview_label.configure(height=240)
-
-        # Start preview thread
-        self._preview_thread = threading.Thread(target=self._preview_loop, daemon=True)
-        self._preview_thread.start()
-
-        # ── Controls ────────────────────────────────────────────────────
-        body = customtkinter.CTkFrame(self, fg_color="transparent")
-        body.grid(row=1, column=0, padx=24, pady=(0, 10), sticky="ew")
-        body.grid_columnconfigure(0, weight=1)
-
-        # Mirror X
-        self.mirror_x_var = customtkinter.BooleanVar(value=self.mirror_x)
-        customtkinter.CTkCheckBox(
-            body, text="Cermin Horizontal (kiri-kanan)",
-            variable=self.mirror_x_var, font=(_FONT_PRIMARY[0], 13),
-            fg_color=_CLR_ACCENT, hover_color=_CLR_ACCENT2,
-        ).grid(row=0, column=0, sticky="w", pady=(0, 12))
-
-        # Mirror Y
-        self.mirror_y_var = customtkinter.BooleanVar(value=self.mirror_y)
-        customtkinter.CTkCheckBox(
-            body, text="Cermin Vertikal (atas-bawah)",
-            variable=self.mirror_y_var, font=(_FONT_PRIMARY[0], 13),
-            fg_color=_CLR_ACCENT, hover_color=_CLR_ACCENT2,
-        ).grid(row=1, column=0, sticky="w", pady=(0, 12))
-
-        # Zoom slider
-        customtkinter.CTkLabel(
-            body, text="Zoom",
-            font=(_FONT_PRIMARY[0], 13, "bold"), text_color=_CLR_MUTED,
-        ).grid(row=2, column=0, sticky="w", pady=(0, 6))
-
-        zoom_frame = customtkinter.CTkFrame(body, fg_color="transparent")
-        zoom_frame.grid(row=3, column=0, sticky="ew", pady=(0, 10))
-        zoom_frame.grid_columnconfigure(0, weight=1)
-
-        self.zoom_slider = customtkinter.CTkSlider(
-            zoom_frame, from_=0.5, to=3.0, number_of_steps=25,
-            command=self._on_zoom_change
-        )
-        self.zoom_slider.set(self.zoom)
-        self.zoom_slider.grid(row=0, column=1, sticky="ew")
-
-        customtkinter.CTkLabel(
-            zoom_frame, text="0.5x", font=(_FONT_PRIMARY[0], 10),
-            text_color=_CLR_MUTED,
-        ).grid(row=1, column=0, sticky="w")
-
-        self.zoom_label = customtkinter.CTkLabel(
-            zoom_frame, text=f"{self.zoom:.1f}x",
-            font=(_FONT_PRIMARY[0], 14, "bold"), text_color=_CLR_ACCENT, width=50
-        )
-        self.zoom_label.grid(row=0, column=2, padx=(10, 0))
-
-        customtkinter.CTkLabel(
-            zoom_frame, text="3.0x", font=(_FONT_PRIMARY[0], 10),
-            text_color=_CLR_MUTED,
-        ).grid(row=1, column=2, sticky="e")
-
-        # Zoom preset buttons
-        preset_frame = customtkinter.CTkFrame(body, fg_color="transparent")
-        preset_frame.grid(row=4, column=0, sticky="ew", pady=(0, 16))
-        for i, z in enumerate([1.0, 1.5, 2.0]):
-            preset_frame.grid_columnconfigure(i, weight=1)
-            customtkinter.CTkButton(
-                preset_frame, text=f"{z:.1f}x",
-                command=lambda v=z: self._set_zoom(v),
-                font=(_FONT_PRIMARY[0], 12, "bold"),
-                fg_color=_CLR_CARD, hover_color=_CLR_SUBTLE_BORDER,
-                text_color=_CLR_TEXT, corner_radius=_CORNER_RADIUS_SMALL, height=36,
-            ).grid(row=0, column=i, padx=(0 if i == 0 else 4, 4 if i < 2 else 0), sticky="ew")
-
-        # Buttons
-        btn_frame = customtkinter.CTkFrame(body, fg_color="transparent")
-        btn_frame.grid(row=5, column=0, sticky="ew")
-        btn_frame.grid_columnconfigure(0, weight=1)
-        btn_frame.grid_columnconfigure(1, weight=1)
-        btn_frame.grid_columnconfigure(2, weight=1)
-
-        customtkinter.CTkButton(
-            btn_frame, text="Batal",
-            command=self._close,
-            font=(_FONT_PRIMARY[0], 13, "bold"),
-            fg_color=_CLR_SUBTLE_BORDER, hover_color=_CLR_ACCENT,
-            text_color=_CLR_TEXT,
-            corner_radius=_CORNER_RADIUS, height=48,
-        ).grid(row=0, column=0, padx=(0, 8), sticky="ew")
-
-        customtkinter.CTkButton(
-            btn_frame, text="Terapkan",
-            command=self._apply,
-            font=(_FONT_PRIMARY[0], 13, "bold"),
-            fg_color=_CLR_CARD, hover_color=_CLR_SUBTLE_BORDER,
-            text_color=_CLR_TEXT,
-            corner_radius=_CORNER_RADIUS, height=48,
-        ).grid(row=0, column=1, padx=4, sticky="ew")
-
-        customtkinter.CTkButton(
-            btn_frame, text="Simpan",
-            command=self._save,
-            font=(_FONT_PRIMARY[0], 13, "bold"),
-            fg_color=_CLR_ACCENT, hover_color=_CLR_ACCENT2,
-            text_color=_CLR_TEXT,
-            corner_radius=_CORNER_RADIUS, height=48,
-        ).grid(row=0, column=2, sticky="ew")
-
-        self.protocol("WM_DELETE_WINDOW", self._close)
-
-    def _preview_loop(self):
-        """Read camera frames and update preview in main thread."""
-        import cv2
-        pw, ph = 320, 240
-        self._current_imgtk = None
-        while self.running:
-            ret, frame = cap.read()
-            if not ret:
-                time.sleep(0.1)
-                continue
-
-            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-
-            # Apply current settings
-            if self.mirror_x_var.get():
-                frame = cv2.flip(frame, 1)
-            if self.mirror_y_var.get():
-                frame = cv2.flip(frame, 0)
-            zoom = self.zoom_slider.get()
-            if zoom != 1.0:
-                h, w = frame.shape[:2]
-                new_w, new_h = int(w * zoom), int(h * zoom)
-                frame = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
-                if zoom > 1.0:
-                    start_x = (new_w - w) // 2
-                    start_y = (new_h - h) // 2
-                    frame = frame[start_y:start_y+h, start_x:start_x+w]
-
-            img = Image.fromarray(frame).resize((pw, ph), Image.LANCZOS)
-            self._current_imgtk = ImageTk.PhotoImage(img)
-
-            def upd(im=None):
-                if im:
-                    self.preview_label.configure(image=im)
-            self.after(0, lambda im=self._current_imgtk: upd(im))
-            time.sleep(0.03)
-
-    def _on_zoom_change(self, value):
-        self.zoom_label.configure(text=f"{value:.1f}x")
-
-    def _set_zoom(self, value):
-        self.zoom_slider.set(value)
-        self._on_zoom_change(value)
-
-    def _apply(self):
-        mirror_x = self.mirror_x_var.get()
-        mirror_y = self.mirror_y_var.get()
-        zoom = round(self.zoom_slider.get(), 1)
-        self.master._update_camera_settings(mirror_x, mirror_y, zoom)
-
-    def _save(self):
-        self._apply()
-        self._close()
-
-    def _close(self):
-        self.running = False
-        self.destroy()
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  App_Room  — Multiplayer lobby (create / join / ready)

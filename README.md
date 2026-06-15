@@ -55,9 +55,13 @@ Window starts maximized with dark theme. Linux uses `attributes('-zoomed')`, oth
 | `HIDE_CAMERA` | `true` / `false` | `false` | Hide camera feed entirely |
 | `CUSTOM_LEVEL` | e.g. `1a,2b,3c` | (empty) | Override random level variant |
 | `CAMERA_INDEX` | integer | `0` | Camera device index |
-| `CAMERA_MIRROR_X` | `true` / `false` | `true` | Horizontal flip |
+| `CAMERA_MIRROR_X` | `true` / `false` | `false` | Horizontal flip |
 | `CAMERA_MIRROR_Y` | `true` / `false` | `false` | Vertical flip |
 | `CAMERA_ZOOM` | float 0.5-3.0 | `1.0` | Camera zoom |
+| `CAMERA_CALIBRATION` | `true` / `false` | `false` | `true` = manual brightness/contrast/saturation; `false` = default webcam |
+| `CAMERA_BRIGHTNESS` | integer 0-255 | `128` | Camera brightness (hardware) |
+| `CAMERA_CONTRAST` | integer 0-255 | `128` | Camera contrast (hardware) |
+| `CAMERA_SATURATION` | integer 0-255 | `128` | Camera saturation (hardware) |
 | `DEBUG_MODE` | `true` / `false` | `false` | Print performance metrics |
 | `THEME` | `dark` / `light` | `dark` | UI theme (restart needed) |
 | `YOLO_SKIP_FRAMES` | integer | `2` | YOLO every N+1 frames |
