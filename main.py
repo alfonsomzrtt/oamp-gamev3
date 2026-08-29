@@ -1386,10 +1386,9 @@ class App_Input(customtkinter.CTk): #CTkToplevel
     def _start_camera_preview(self):
         self._preview_running = True
         self._current_imgtk = None
-        threading.Thread(target=self._preview_loop, daemon=True).start()
-        threading.Thread(target=self._detect_cameras, daemon=True).start()
+        threading.Thread(target=self._detect_cameras_then_preview, daemon=True).start()
 
-    def _detect_cameras(self):
+    def _detect_cameras_then_preview(self):
         available = _enumerate_cameras(max_index=5)
         self._available_cameras = available
         if available:
@@ -1397,6 +1396,8 @@ class App_Input(customtkinter.CTk): #CTkToplevel
             self.after(0, lambda: self._update_camera_dropdown(labels, available))
         else:
             self.after(0, lambda: self._update_camera_dropdown(["Tidak ada kamera"], []))
+        self._switch_camera(CAMERA_INDEX)    
+        threading.Thread(target=self._preview_loop, daemon=True).start()
 
     def _update_camera_dropdown(self, labels, indices):
         self._detecting_cameras = False
@@ -1514,6 +1515,7 @@ class App_Input(customtkinter.CTk): #CTkToplevel
 
     def _preview_loop(self):
         import cv2 as _cv2
+        time.sleep(0.8)
         _qframe = 0
         _dframe = 0
         while self._preview_running:
@@ -1798,12 +1800,8 @@ class App_Input(customtkinter.CTk): #CTkToplevel
 
 # ── Initialize camera (needed before App_Input for preview) ────────────────
 import platform as _platform_mod
-if _platform_mod.system() == 'Windows':
-    cap = cv2.VideoCapture(CAMERA_INDEX, cv2.CAP_DSHOW)
-else:
-    cap = cv2.VideoCapture(CAMERA_INDEX)
-_cap_set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-_cap_set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+cap = None
+    
 # WARNING: brightness/contrast/saturation are SOFTWARE filters in _preview_loop / streaming()
 # Never use cap.set() for those — they persist in camera driver across app restarts!
 
@@ -1912,7 +1910,7 @@ class YOLODetectionThread(threading.Thread):
                         else:
                             list_tracked_objects = []
                     else:
-                        results = self.model(frame)
+                        results = self.model(frame, size=320)
                         df_tracked_objects = results.pandas().xyxy[0]
                         list_tracked_objects = df_tracked_objects.values.tolist()
                     
@@ -2918,6 +2916,13 @@ class TimeIn(customtkinter.CTk):
             )
             self._winlose_label.grid(row=0, column=0, pady=18)
 
+        def _stat_card(parent, title, value):
+            c = customtkinter.CTkFrame(parent, fg_color=_CLR_CARD, corner_radius=_CORNER_RADIUS, border_width=1, border_color=_CLR_SUBTLE_BORDER)
+            c.grid_columnconfigure(0, weight=1)
+            customtkinter.CTkLabel(c, text=title, font=(_FONT_PRIMARY[0], 12), text_color=_CLR_MUTED).grid(row=0, column=0, pady=(12, 0))
+            customtkinter.CTkLabel(c, text=value, font=(_FONT_PRIMARY[0], 20, "bold"), text_color=_CLR_TEXT).grid(row=1, column=0, pady=(0, 12))
+            return c
+
         # Stats row
         stats = customtkinter.CTkFrame(self.results_frame, fg_color="transparent")
         stats.grid(row=4, column=0, sticky="ew", padx=20, pady=(0, 12))
@@ -2934,12 +2939,6 @@ class TimeIn(customtkinter.CTk):
             _stat_card(stats, "Usia Kognitif", f"{age_cog} th").grid(row=0, column=1, padx=4, sticky="ew")
             _stat_card(stats, "Visual-Spasial", f"{visuo_spatial}%").grid(row=0, column=2, padx=(4, 0), sticky="ew")
 
-        def _stat_card(parent, title, value):
-            c = customtkinter.CTkFrame(parent, fg_color=_CLR_CARD, corner_radius=_CORNER_RADIUS, border_width=1, border_color=_CLR_SUBTLE_BORDER)
-            c.grid_columnconfigure(0, weight=1)
-            customtkinter.CTkLabel(c, text=title, font=(_FONT_PRIMARY[0], 12), text_color=_CLR_MUTED).grid(row=0, column=0, pady=(12, 0))
-            customtkinter.CTkLabel(c, text=value, font=(_FONT_PRIMARY[0], 20, "bold"), text_color=_CLR_TEXT).grid(row=1, column=0, pady=(0, 12))
-            return c
 
         # Duel / Tournament result banner
         if IS_MULTIPLAYER and CURRENT_ROOM_CODE:

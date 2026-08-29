@@ -31,7 +31,7 @@ import cv2
 import IPython
 import numpy as np
 import pandas as pd
-import pkg_resources as pkg
+# import pkg_resources as pkg
 import torch
 import torchvision
 import yaml
@@ -39,6 +39,12 @@ import yaml
 from utils import TryExcept, emojis
 from utils.downloads import gsutil_getsize
 from utils.metrics import box_iou, fitness
+
+try: 
+    import pkg_resources as pkg
+except ImportError:
+    import importlib.metadata as pkg
+
 
 FILE = Path(__file__).resolve()
 ROOT = FILE.parents[1]  # YOLOv5 root directory
@@ -400,17 +406,17 @@ def check_requirements(requirements=ROOT / 'requirements.txt', exclude=(), insta
             s += f'"{r}" '
             n += 1
 
-    if s and install and AUTOINSTALL:  # check environment variable
-        LOGGER.info(f"{prefix} YOLOv5 requirement{'s' * (n > 1)} {s}not found, attempting AutoUpdate...")
-        try:
-            # assert check_online(), "AutoUpdate skipped (offline)"
-            LOGGER.info(check_output(f'pip install {s} {cmds}', shell=True).decode())
-            source = file if 'file' in locals() else requirements
-            s = f"{prefix} {n} package{'s' * (n > 1)} updated per {source}\n" \
-                f"{prefix} ⚠️ {colorstr('bold', 'Restart runtime or rerun command for updates to take effect')}\n"
-            LOGGER.info(s)
-        except Exception as e:
-            LOGGER.warning(f'{prefix} ❌ {e}')
+    # if s and install and AUTOINSTALL:  # check environment variable
+    #     LOGGER.info(f"{prefix} YOLOv5 requirement{'s' * (n > 1)} {s}not found, attempting AutoUpdate...")
+    #     try:
+    #         # assert check_online(), "AutoUpdate skipped (offline)"
+    #         LOGGER.info(check_output(f'pip install {s} {cmds}', shell=True).decode())
+    #         source = file if 'file' in locals() else requirements
+    #         s = f"{prefix} {n} package{'s' * (n > 1)} updated per {source}\n" \
+    #             f"{prefix} ⚠️ {colorstr('bold', 'Restart runtime or rerun command for updates to take effect')}\n"
+    #         LOGGER.info(s)
+    #     except Exception as e:
+    #         LOGGER.warning(f'{prefix} ❌ {e}')
 
 
 def check_img_size(imgsz, s=32, floor=0):

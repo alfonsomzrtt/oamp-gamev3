@@ -4,7 +4,7 @@ CLAUDE.md
 
 
 .env
-venv/
+oampv3_venv/
 __pycache__/
 *.pyc
 testing_tts.py

@@ -18,3 +18,4 @@ pyserial
 requests
 websocket-client
 ipython
+setuptools==69.5.1
