@@ -2,7 +2,7 @@ AGENTS.md
 CLAUDE.md
 .claude/
 
-
+.src/
 .env
 oampv3_venv/
 __pycache__/

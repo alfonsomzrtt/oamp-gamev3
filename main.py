@@ -17,8 +17,14 @@ import serial.tools.list_ports
 from datetime import datetime
 
  # Load environment variables from .env file
-env_path = Path('.') / '.env'
-load_dotenv(dotenv_path=env_path)
+if getattr(sys, 'frozen', False):
+    base = Path(sys.executable).parent  # saat jalan sebagai .exe
+else:
+    base = Path(__file__).parent        # saat jalan sebagai .py
+    
+env_path = base / '.env'
+load_dotenv(dotenv_path=env_path, override=True)
+
 
 ERROR_LOG_PATH = Path(__file__).resolve().parent / "runtime_errors.log"
 
@@ -79,6 +85,15 @@ except (ValueError, TypeError):
     CAMERA_ZOOM = 1.0
 
 CAMERA_BRIGHTNESS = int(os.getenv('CAMERA_BRIGHTNESS', '128'))
+
+# Camera slider display bounds (persen %)
+_SLIDER_BOUNDS = {"brightness": (64, 191), "contrast": (77, 191), "saturation": (77, 166)}
+
+def _remap_slider(val, attr):
+    mn, mx = _SLIDER_BOUNDS.get(attr, (0, 255))
+    return round(mn + (val / 255) * (mx - mn))
+    
+    
 CAMERA_CONTRAST = int(os.getenv('CAMERA_CONTRAST', '128'))
 CAMERA_SATURATION = int(os.getenv('CAMERA_SATURATION', '128'))
 CAMERA_CALIBRATION = os.getenv('CAMERA_CALIBRATION', 'false').lower() == 'true'
@@ -1298,7 +1313,7 @@ class App_Input(customtkinter.CTk): #CTkToplevel
             s.grid(row=0, column=ci * 3 + 1, sticky="ew")
             setattr(self, f"_slider_{attr}", s)
             lbl = customtkinter.CTkLabel(
-                self._img_quality_frame, text=str(val),
+                self._img_quality_frame, text=f"{round(val / 255 * 100)}%",
                 font=(_FONT_PRIMARY[0], 10, "bold"), text_color=_CLR_ACCENT, width=28,
             )
             lbl.grid(row=0, column=ci * 3 + 2, padx=(4, 0))
@@ -1483,13 +1498,14 @@ class App_Input(customtkinter.CTk): #CTkToplevel
         val = int(round(value))
         lbl = getattr(self, f"_slider_{attr}_label", None)
         if lbl:
-            lbl.configure(text=str(val))
+            pct = round(val / 255 * 100)
+            lbl.configure(text=f"{pct}%")
         if attr == "brightness":
-            CAMERA_BRIGHTNESS = val
+            CAMERA_BRIGHTNESS = _remap_slider(val, attr)
         elif attr == "contrast":
-            CAMERA_CONTRAST = val
+            CAMERA_CONTRAST = _remap_slider(val, attr)
         elif attr == "saturation":
-            CAMERA_SATURATION = val
+            CAMERA_SATURATION = _remap_slider(val, attr)
 
     def _save_camera_settings(self):
         _save_env_value('CAMERA_INDEX', str(CAMERA_INDEX))
