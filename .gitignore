@@ -3,8 +3,8 @@ CLAUDE.md
 .claude/
 
 
-.env
-oampv3_venv/
+.env/
+/oamp_venv/
 __pycache__/
 *.pyc
 testing_tts.py
