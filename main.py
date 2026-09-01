@@ -21,7 +21,7 @@ if getattr(sys, 'frozen', False):
     base = Path(sys.executable).parent  # saat jalan sebagai .exe
 else:
     base = Path(__file__).parent        # saat jalan sebagai .py
-    
+
 env_path = base / '.env'
 load_dotenv(dotenv_path=env_path, override=True)
 
