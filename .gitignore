@@ -3,8 +3,9 @@ CLAUDE.md
 .claude/
 
 run.bat
+/src/
 .env/
-/oamp_venv/
+/oampv3_venv/
 __pycache__/
 *.pyc
 testing_tts.py
