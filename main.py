@@ -17,8 +17,14 @@ import serial.tools.list_ports
 from datetime import datetime
 
  # Load environment variables from .env file
-env_path = Path('.') / '.env'
-load_dotenv(dotenv_path=env_path)
+if getattr(sys, 'frozen', False):
+    base = Path(sys.executable).parent  # saat jalan sebagai .exe
+else:
+    base = Path(__file__).parent        # saat jalan sebagai .py
+
+env_path = base / '.env'
+load_dotenv(dotenv_path=env_path, override=True)
+
 
 ERROR_LOG_PATH = Path(__file__).resolve().parent / "runtime_errors.log"
 
@@ -68,7 +74,7 @@ BUTTON_MODE = os.getenv('BUTTON_MODE', 'false').lower() == 'true'
 HIDE_CAMERA = os.getenv('HIDE_CAMERA', 'false').lower() == 'true'
 
 # Camera settings
-CAMERA_INDEX = int(os.getenv('CAMERA_INDEX', '0'))
+CAMERA_INDEX = int(os.getenv('CAMERA_INDEX', '4'))
 CAMERA_MIRROR_X = os.getenv('CAMERA_MIRROR_X', 'false').lower() == 'true'
 CAMERA_MIRROR_Y = os.getenv('CAMERA_MIRROR_Y', 'false').lower() == 'true'
 try:
@@ -1517,7 +1523,9 @@ class App_Input(customtkinter.CTk): #CTkToplevel
         self._block_test_active = not self._block_test_active
         if self._block_test_active:
             self.detect_btn.configure(text="Stop Tes", fg_color=_CLR_DANGER)
-            self.detect_result.configure(text="Deteksi aktif — blok di-highlight (hijau)", text_color=_CLR_SUCCESS)
+            self.detect_result.configure(
+                text="Deteksi aktif — blok di-highlight (hijau), klasifikasi aktif",
+                text_color=_CLR_SUCCESS)
         else:
             self.detect_btn.configure(text="Tes Blok", fg_color=_CLR_SUCCESS)
             self.detect_result.configure(text="")
@@ -1583,27 +1591,103 @@ class App_Input(customtkinter.CTk): #CTkToplevel
                         try:
                             if USE_BANTAL_MODEL:
                                 _res = model_yolo(frame, verbose=False)
-                                self._last_block_detections = _res[0].boxes if (len(_res) > 0 and hasattr(_res[0], 'boxes')) else []
+                                _raw = []
+                                if len(_res) > 0 and hasattr(_res[0], 'boxes'):
+                                    for _b in _res[0].boxes:
+                                        _x1b, _y1b, _x2b, _y2b = _b.xyxy[0].cpu().numpy()
+                                        _raw.append([float(_x1b), float(_y1b), float(_x2b), float(_y2b), float(_b.conf[0].cpu().numpy())])
+                                self._last_block_detections = _raw
                             else:
                                 _res = model_yolo(frame)
-                                self._last_block_detections = _res.pandas().xyxy[0].values.tolist()
+                                self._last_block_detections = [
+                                    [row[0], row[1], row[2], row[3], row[4]]
+                                    for row in _res.pandas().xyxy[0].values.tolist()
+                                ]
                         except Exception:
                             self._last_block_detections = []
-                    _count = 0
-                    if USE_BANTAL_MODEL:
-                        for _b in self._last_block_detections:
-                            _x1, _y1, _x2, _y2 = [int(v) for v in _b.xyxy[0].cpu().numpy()]
-                            if float(_b.conf[0].cpu().numpy()) > 0.7:
-                                _cv2.rectangle(frame, (_x1, _y1), (_x2, _y2), (0, 255, 0), 2)
-                                _count += 1
-                    else:
-                        for _d in self._last_block_detections:
-                            _x1, _y1, _x2, _y2, _conf = int(_d[0]), int(_d[1]), int(_d[2]), int(_d[3]), float(_d[4])
-                            if _conf > 0.7:
-                                _cv2.rectangle(frame, (_x1, _y1), (_x2, _y2), (0, 255, 0), 2)
-                                _count += 1
-                    _cv2.putText(frame, f"Blok: {_count}", (12, 36), _cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 3)
 
+                    # Threshold — same as main streaming loop
+                    _imgBlur = _cv2.GaussianBlur(frame, (7, 7), 1)
+                    _imgGray = _cv2.cvtColor(_imgBlur, _cv2.COLOR_RGB2GRAY)
+                    _, _imgThres = _cv2.threshold(_imgGray, 175, 255, _cv2.THRESH_BINARY)
+
+                    _box_design = []
+                    _pos_x = []
+                    _pos_y = []
+                    _box_num = 0
+
+                    _face_imgs  = [None, face_01,      face_02,      face_03,      face_04,      face_05,      face_06]
+                    _face_masks = [None, mask_face_01, mask_face_02, mask_face_03, mask_face_04, mask_face_05, mask_face_06]
+
+                    for _det in self._last_block_detections:
+                        _x1, _y1, _x2, _y2, _conf = (
+                            int(_det[0]), int(_det[1]), int(_det[2]), int(_det[3]), float(_det[4])
+                        )
+                        if _conf <= 0.7:
+                            continue
+                        _w, _h = _x2 - _x1, _y2 - _y1
+                        _cx, _cy = (_x1 + _x2) // 2, (_y1 + _y2) // 2
+
+                        # Face classification
+                        _box_face = 0
+                        if (_y1 >= 0 and _y2 <= _imgThres.shape[0] and
+                                _x1 >= 0 and _x2 <= _imgThres.shape[1] and _h > 0 and _w > 0):
+                            _imgBox = _cv2.resize(_imgThres[_y1:_y2, _x1:_x2], (100, 100),
+                                                  interpolation=_cv2.INTER_AREA)
+                            _bc = [_imgBox[50, 25], _imgBox[75, 50], _imgBox[50, 75], _imgBox[25, 50]]
+                            if   _bc == [0,   0,   0,   0  ]: _box_face = 1
+                            elif _bc == [255, 255, 255, 255]: _box_face = 2
+                            elif _bc == [255, 255, 0,   0  ]: _box_face = 3
+                            elif _bc == [255, 0,   0,   255]: _box_face = 4
+                            elif _bc == [0,   0,   255, 255]: _box_face = 5
+                            elif _bc == [0,   255, 255, 0  ]: _box_face = 6
+
+                        if _box_face == 0:
+                            continue
+
+                        _box_design.append(_box_face)
+                        _pos_x.append(_cx)
+                        _pos_y.append(_cy)
+                        _box_num += 1
+
+                        _cv2.rectangle(frame, (_x1, _y1), (_x1 + _w, _y1 + _h), (0, 255, 0), 2)
+
+                        # Face label overlay (top-left corner of box)
+                        _roi = frame[_y1:_y1 + 50, _x1:_x1 + 50]
+                        if _roi.shape[0] == 50 and _roi.shape[1] == 50:
+                            try:
+                                _roi[np.where(_face_masks[_box_face])] = 0
+                                _roi += _face_imgs[_box_face]
+                            except Exception:
+                                pass
+
+                    # When 4 boxes: draw connections + sort + show result
+                    _result_text = f"Blok terdeteksi: {_box_num}"
+                    if len(_box_design) == 4:
+                        for _i in range(4):
+                            for _j in range(_i + 1, 4):
+                                _cv2.line(frame,
+                                          (_pos_x[_i], _pos_y[_i]),
+                                          (_pos_x[_j], _pos_y[_j]),
+                                          (0, 0, 0), 2)
+                        # Sort: kiri → kanan, atas → bawah (sama dengan main loop)
+                        _sx = sorted(_pos_x)
+                        _mid = (_sx[1] + _sx[2]) / 2
+                        _idx_pos = [(px, py, idx) for idx, (px, py) in enumerate(zip(_pos_x, _pos_y))]
+                        _idx_pos.sort(key=lambda p: (p[0] >= _mid, p[1]))
+                        _sorted = [_box_design[idx] for (_, _, idx) in _idx_pos]
+                        _result_text = f"Blok: {_box_num}  |  Urutan: {_sorted}"
+
+                    _cv2.putText(frame, f"Blok: {_box_num}", (12, 36),
+                                 _cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
+
+                    _rt = _result_text
+                    _ok = len(_box_design) == 4
+                    self.after(0, lambda t=_rt, ok=_ok: self.detect_result.configure(
+                        text=t,
+                        text_color=_CLR_SUCCESS if ok else _CLR_MUTED,
+                    ))
+                    
                 # Aspect-ratio-preserving letterbox (like TimeIn)
                 h_f, w_f = frame.shape[:2]
                 scale = min(cw / w_f, ch / h_f)
@@ -1617,8 +1701,8 @@ class App_Input(customtkinter.CTk): #CTkToplevel
                 self.after(0, lambda im=self._current_imgtk: upd(im))
             except Exception:
                 pass
-            time.sleep(0.03)
-
+            time.sleep(0.03)   
+             
     # ── QR Code auto-fill ─────────────────────────────────────────────────
     def _on_qr_detected(self, uid):
         """QR code detected in camera preview — auto-fill UID + auto-verify."""

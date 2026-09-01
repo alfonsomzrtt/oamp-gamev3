@@ -2,7 +2,7 @@ AGENTS.md
 CLAUDE.md
 .claude/
 
-
+run.bat
 .env/
 /oamp_venv/
 __pycache__/
