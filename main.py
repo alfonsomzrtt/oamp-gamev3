@@ -1693,7 +1693,7 @@ class App_Input(customtkinter.CTk): #CTkToplevel
 
                     _cv2.putText(frame, f"Blok: {_box_num}", (12, 36),
                                  _cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
-                    _cv2.putText(frame, f"Conf: {self._block_test_confidence:.2f}", (12, 72),
+                    _cv2.putText(frame, f"Confidence: {self._block_test_confidence:.2f}", (12, 72),
                                  _cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
 
                     _rt = _result_text
