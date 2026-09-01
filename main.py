@@ -1360,6 +1360,7 @@ class App_Input(customtkinter.CTk): #CTkToplevel
         # ── Block detection test (toggle mode) ─────────────────────────
         self._block_test_active = False
         self._last_block_detections = []
+        self._block_test_confidence = 0.0
 
     def _on_close(self):
         self._preview_running = False
@@ -1521,10 +1522,11 @@ class App_Input(customtkinter.CTk): #CTkToplevel
 
     def _test_block_detection(self):
         self._block_test_active = not self._block_test_active
+        self._block_test_confidence = 0.0
         if self._block_test_active:
             self.detect_btn.configure(text="Stop Tes", fg_color=_CLR_DANGER)
             self.detect_result.configure(
-                text="Deteksi aktif — blok di-highlight (hijau), klasifikasi aktif",
+                text="Deteksi aktif — blok di-highlight (hijau), klasifikasi aktif | Confidence: 0.00",
                 text_color=_CLR_SUCCESS)
         else:
             self.detect_btn.configure(text="Tes Blok", fg_color=_CLR_SUCCESS)
@@ -1611,6 +1613,17 @@ class App_Input(customtkinter.CTk): #CTkToplevel
                     _imgGray = _cv2.cvtColor(_imgBlur, _cv2.COLOR_RGB2GRAY)
                     _, _imgThres = _cv2.threshold(_imgGray, 175, 255, _cv2.THRESH_BINARY)
 
+                    _confidence_scores = []
+                    for _det in self._last_block_detections:
+                        if len(_det) > 4:
+                            try:
+                                _confidence_scores.append(float(_det[4]))
+                            except (TypeError, ValueError):
+                                pass
+                    self._block_test_confidence = round(
+                        sum(_confidence_scores) / len(_confidence_scores), 3
+                    ) if _confidence_scores else 0.0
+
                     _box_design = []
                     _pos_x = []
                     _pos_y = []
@@ -1662,7 +1675,7 @@ class App_Input(customtkinter.CTk): #CTkToplevel
                                 pass
 
                     # When 4 boxes: draw connections + sort + show result
-                    _result_text = f"Blok terdeteksi: {_box_num}"
+                    _result_text = f"Blok terdeteksi: {_box_num} | Confidence: {self._block_test_confidence:.2f}"
                     if len(_box_design) == 4:
                         for _i in range(4):
                             for _j in range(_i + 1, 4):
@@ -1676,10 +1689,12 @@ class App_Input(customtkinter.CTk): #CTkToplevel
                         _idx_pos = [(px, py, idx) for idx, (px, py) in enumerate(zip(_pos_x, _pos_y))]
                         _idx_pos.sort(key=lambda p: (p[0] >= _mid, p[1]))
                         _sorted = [_box_design[idx] for (_, _, idx) in _idx_pos]
-                        _result_text = f"Blok: {_box_num}  |  Urutan: {_sorted}"
+                        _result_text = f"Blok: {_box_num} | Confidence: {self._block_test_confidence:.2f} | Urutan: {_sorted}"
 
                     _cv2.putText(frame, f"Blok: {_box_num}", (12, 36),
                                  _cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
+                    _cv2.putText(frame, f"Conf: {self._block_test_confidence:.2f}", (12, 72),
+                                 _cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
 
                     _rt = _result_text
                     _ok = len(_box_design) == 4
@@ -1702,7 +1717,7 @@ class App_Input(customtkinter.CTk): #CTkToplevel
             except Exception:
                 pass
             time.sleep(0.03)   
-             
+
     # ── QR Code auto-fill ─────────────────────────────────────────────────
     def _on_qr_detected(self, uid):
         """QR code detected in camera preview — auto-fill UID + auto-verify."""
