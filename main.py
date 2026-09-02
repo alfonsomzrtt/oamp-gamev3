@@ -26,6 +26,7 @@ env_path = base / '.env'
 load_dotenv(dotenv_path=env_path, override=True)
 
 
+
 ERROR_LOG_PATH = Path(__file__).resolve().parent / "runtime_errors.log"
 
 def log_exception(context, exc_type, exc_value, exc_tb):
@@ -1114,6 +1115,7 @@ class App_Input(customtkinter.CTk): #CTkToplevel
     def __init__(self):
         super().__init__()
 
+        self.user_cancelled = False
         self.title("Block Design Test")
         self.geometry("640x780")
         self.configure(fg_color=_CLR_BG)
@@ -1364,7 +1366,9 @@ class App_Input(customtkinter.CTk): #CTkToplevel
 
     def _on_close(self):
         self._preview_running = False
+        self.user_cancelled = True
         self.destroy()
+        sys.exit(0)
 
     def destroy(self):
         self._preview_running = False
@@ -1915,31 +1919,199 @@ cap = None
 # Never use cap.set() for those — they persist in camera driver across app restarts!
 
 
-print(">>> Start Test ...")
+# Informed Consent
+CONSENT_FILE = base / "consent_accepted.txt"
+CONSENT_VERSION = "1.0" #Naikkan versi ini setiap teks consent diperbarui
 
-try:
-    if CURRENT_MODE == "training":
-        nick_name = "training_user"
-        gender_code = ""
-        age_range_code = 0
-        current_participant_uid = ""
-        print(">>> CURRENT_MODE=training — App_Input optional, using placeholder data")
-        app_input = App_Input()
-        app_input._start_camera_preview()
-        app_input.after(0, lambda: app_input.attributes('-zoomed', True) if sys.platform == 'linux' else app_input.state('zoomed'))
-        app_input.mainloop()
-    else:
-        app_input = App_Input()
-        app_input._start_camera_preview()
-        app_input.after(0, lambda: app_input.attributes('-zoomed', True) if sys.platform == 'linux' else app_input.state('zoomed'))
-        app_input.mainloop()
-except Exception:
-    print(">>> Failed while running input window. Full traceback:")
-    traceback.print_exc()
-    raise SystemExit(1)
+def check_consent():
+  """Memeriksa apakah file persetujuan lokal sudah ada."""
+  if not os.path.exists(CONSENT_FILE):
+    return False
+    try:
+        with open(CONSENT_FILE, "r", encoding="utf-8") as f:
+            data = _json.load(f)
+        return data.get("accepted") is True and data.get("consent_version") == CONSENT_VERSION
+    except Exception:
+        # File rusak / format lama → anggap belum consent
+        return False
 
+def mark_consent_accepted():
+    """Simpan persetujuan dengan timestamp dan versi consent."""
+    try:
+        payload = {
+            "accepted":        True,
+            "consent_version": CONSENT_VERSION,
+            "timestamp":       datetime.now().isoformat(),
+        }
+        with open(CONSENT_FILE, "w", encoding="utf-8") as f:
+            _json.dump(payload, f, indent=2)
+        print(f">>> [CONSENT] Accepted — version {CONSENT_VERSION} @ {payload['timestamp']}")
+    
+    except Exception as e:
+        print(f">>> Gagal menulis file consent: {e}")
 
+class App_Consent(customtkinter.CTkToplevel):
 
+    def __init__(self, parent, on_accept_callback):
+        super().__init__(parent)
+        self.title("Persetujuan Pengguna & Informed Consent - OAMP Desktop")
+        self.geometry("650x520")
+        self.resizable(False, False)
+        self.on_accept_callback = on_accept_callback
+
+        # Kunci fokus modal window
+        # self.transient(parent)
+        self.grab_set()
+        
+
+        # Center window
+        self.update_idletasks()
+        w = self.winfo_width()
+        h = self.winfo_height()
+        x = (self.winfo_screenwidth() // 2) - (w // 2)
+        y = (self.winfo_screenheight() // 2) - (h // 2)
+        self.geometry(f"{w}x{h}+{x}+{y}")
+
+        lbl_title = customtkinter.CTkLabel(
+            self,
+            text="Formulir Persetujuan Pengguna & Kebijakan Privasi",
+            font=customtkinter.CTkFont(size=18, weight="bold"),
+            text_color=_CLR_TEXT,
+        )
+        lbl_title.pack(pady=(15, 5))
+
+        # Teks Syarat & Ketentuan
+        text_frame = customtkinter.CTkTextbox(
+            self,
+            width=600,
+            height=320,
+            fg_color=_CLR_CARD,
+            text_color=_CLR_TEXT,
+            corner_radius=_CORNER_RADIUS,
+            font=customtkinter.CTkFont(
+                family="Segoe UI", size=13),  # Font proporsional modern
+        )
+        text_frame.pack(pady=5, padx=20)
+
+        consent_text = (
+            "PERSETUJUAN PENGGUNA (INFORMED CONSENT) &\n"
+            "KEBIJAKAN PRIVASI APLIKASI OAMP DESKTOP\n"
+            "--------------------------------------------------------------------------------\n\n"
+            "A. FORMULIR PERSETUJUAN PENGGUNA (INFORMED CONSENT)\n\n"
+            "Dengan ini, saya menyatakan secara sadar dan sukarela bahwa:\n"
+            "1. Saya menyetujui untuk berpartisipasi dalam sesi permainan"
+            " balok desain (Block Design Test) Otak-Atik Merah Putih"
+            " menggunakan aplikasi OAMP Desktop.\n"
+            "2. Saya memahami bahwa aplikasi OAMP Desktop memanfaatkan pemrosesan"
+            " Citra Digital/Kamera (Webcam) dan AI untuk mendeteksi gerakan"
+            " tangan serta susunan balok secara otomatis.\n"
+            "3. Saya mengizinkan sistem untuk mencatat durasi waktu penyelesaian"
+            " tes, level yang berhasil dicapai, serta skor penilaian"
+            " kognitif.\n"
+            "4. Saya memahami bahwa partisipasi ini bersifat sukarela dan saya"
+            " berhak menghentikan tes sewaktu-waktu jika merasa tidak nyaman.\n\n"
+            "--------------------------------------------------------------------------------\n\n"
+            "B. SYARAT & KETENTUAN PENGGUNAAN (USER AGREEMENT)\n\n"
+            "1. Lisensi Penggunaan: Aplikasi OAMP Desktop disediakan khusus"
+            " untuk keperluan asesmen kognitif, kegiatan edukasi, penelitian"
+            " ilmiah, atau kompetisi resmi OAMP. Pengguna dilarang meretas,"
+            " merusak, atau menyalahgunakan sistem backend API.\n\n"
+            "2. Integritas Tes: Pengguna dilarang melakukan manipulasi terhadap"
+            " umpan kamera maupun data konfigurasi lokal untuk merubah hasil"
+            " penilaian kognitif secara tidak sah.\n\n"
+            "3. Batasan Penilaian: Indikator 'Usia Kognitif' (Cognitive Age"
+            " Index) dalam aplikasi disediakan semata-mata untuk analisis"
+            " diagnostik awal dan statistik performa, serta TIDAK menggantikan"
+            " diagnosis klinis/medis resmi dari tenaga profesional.\n\n"
+            "--------------------------------------------------------------------------------\n\n"
+            "C. PENGUMPULAN & PERLINDUNGAN DATA (HOW WE COLLECT YOUR DATA)\n\n"
+            "Kami berkomitmen untuk menjaga transparansi pengelolaan data"
+            " Anda:\n\n"
+            "1. Data yang Dikumpulkan:\n"
+            "   • Data Identitas Peserta: Nickname, Jenis Kelamin, dan UID/ID"
+            " Peserta.\n"
+            "   • Data Performa Tes: Waktu penyelesaian per level (Task 01 - Task"
+            " 08), skor akhir, dan telemetry error.\n"
+            "   • Configuration Log: Pengaturan perangkat lokal (orientasi"
+            " kamera & preferensi UI).\n\n"
+            "2. Pemrosesan Video & Sensor Kamera:\n"
+            "   • ALIRAN VIDEO (STREAM KAMERA) HANYA DIPROSES SECARA REAL-TIME DI"
+            " MEMORI LOKAL PERANGKAT LOKAL ANDA (Client-Side) OLEH MODEL YOLOv5"
+            " & MEDIAPIPE.\n"
+            "   • SISTEM TIDAK MEREKAM, SERVERTIDAK MENYIMPAN, DAN TIDAK MENGUNGGAH"
+            " FOTO/VIDEO PERANGKAT KE  CLOUD ATAU PIHAK KETIGA.\n\n"
+            "3. Penyimpanan Data Hasil Tes:\n"
+            "   • Mode Online: Hasil tes (skor & durasi) dikirimkan ke REST API /"
+            " WebSocket Server OAMP untuk klasemen (leaderboard) dan penentuan"
+            " pemenang duel.\n"
+            "   • Mode Offline: Hasil tes disimpan sebagai cadangan terenkripsi"
+            " lokal pada folder 'results/' dalam format file JSON.\n"
+            "--------------------------------------------------------------------------------"
+        )
+
+        text_frame.insert("0.0", consent_text)
+        text_frame.configure(state="disabled")  # Mode Read-only
+
+        # Checkbox Persetujuan Digital
+        self.var_agree = customtkinter.StringVar(value="off")
+        self.chk_agree = customtkinter.CTkCheckBox(
+            self,
+            text=(
+                "Saya telah membaca, memahami, dan menyetujui seluruh ketentuan di"
+                " atas."
+            ),
+            variable=self.var_agree,
+            onvalue="on",
+            offvalue="off",
+            command=self.toggle_button,
+            text_color=_CLR_TEXT,
+            fg_color=_CLR_ACCENT,
+            hover_color=_CLR_ACCENT2,
+        )
+        self.chk_agree.pack(pady=12)
+
+        # Container Tombol Aksi
+        btn_frame = customtkinter.CTkFrame(self, fg_color="transparent")
+        btn_frame.pack(pady=5)
+
+        self.btn_cancel = customtkinter.CTkButton(
+            btn_frame,
+            text="Tolak & Keluar",
+            fg_color=_CLR_DANGER,
+            hover_color=_CLR_DANGER_HOVER,
+            command=self.on_cancel,
+            width=140,
+        )
+        self.btn_cancel.pack(side="left", padx=10)
+
+        self.btn_accept = customtkinter.CTkButton(
+            btn_frame,
+            text="Setuju & Lanjutkan",
+            state="disabled",
+            fg_color=_CLR_SUCCESS,
+            hover_color=_CLR_SUCCESS_HOVER,
+            command=self.on_accept,
+            width=160,
+        )
+        self.btn_accept.pack(side="right", padx=10)
+
+    def toggle_button(self):
+        """Aktifkan tombol jika checkbox dicentang."""
+        if self.var_agree.get() == "on":
+            self.btn_accept.configure(state="normal")
+        else:
+            self.btn_accept.configure(state="disabled")
+
+    def on_accept(self):
+        """Simpan status persetujuan dan lanjutkan ke layar utama."""
+        mark_consent_accepted()
+        self.grab_release()
+        self.destroy()
+        self.on_accept_callback()
+
+    def on_cancel(self):
+        """Keluar dari aplikasi jika pengguna menolak."""
+        sys.exit(0)
 
 #>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>> Setup GUI Video
 
@@ -4825,34 +4997,84 @@ class App_Room(customtkinter.CTk):
                 pass
         self.destroy()
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-
 if __name__ == "__main__":
     try:
-        if not nick_name:
-            raise SystemExit(0)
+        # 1. CEK INFORMED CONSENT TERLEBIH DAHULU
+        if not check_consent():
+            dummy_root = customtkinter.CTk()
+            dummy_root.withdraw()
 
-        # Competition: go to App_Room first (duel) — skip if tournament match already assigned
+            def on_consent_done():
+                try:
+                    dummy_root.quit()     # Hentikan mainloop secara bersih
+                    dummy_root.destroy()  # Hancurkan window dummy
+                except Exception:
+                    pass
+
+            App_Consent(dummy_root, on_accept_callback=on_consent_done)
+            dummy_root.mainloop()
+
+        # 2. INISIALISASI DAN PELUNCURAN APP_INPUT (LAYAR UTAMA)
+        app_input = App_Input()
+
+        # Jalankan preview kamera VIA after() agar non-blocking
+        if hasattr(app_input, "_start_camera_preview"):
+            app_input.after(200, app_input._start_camera_preview)
+
+        # Zoomed state
+        def _set_zoomed():
+            try:
+                if app_input.winfo_exists():
+                    if sys.platform == "linux":
+                        app_input.attributes("-zoomed", True)
+                    else:
+                        app_input.state("zoomed")
+            except Exception:
+                pass
+
+        app_input.after(100, _set_zoomed)
+        app_input.mainloop()
+
+        # =========================================================================
+        # PENANGANAN EXIT SETELAH APP_INPUT DITUTUP (User klik X atau Selesai)
+        # =========================================================================
+        if not nick_name or nick_name == "NULL":
+            print(">>> User closed App_Input window. Exiting application.")
+            sys.exit(0)
+
+        # 3. JIKA MODE KOMPETISI: Lanjut ke App_Room (Lobby Duel)
         if CURRENT_MODE == "competition":
             IS_MULTIPLAYER = True
             if TOURNAMENT_MODE and TOURNAMENT_ROOM_CODE:
-                # Tournament cup: use pre-assigned room code, skip lobby
                 CURRENT_ROOM_CODE = TOURNAMENT_ROOM_CODE
                 PLAYER_NUM = 1 if TOURNAMENT_IS_P1 else 2
-                print(f">>> Tournament mode — joining room '{CURRENT_ROOM_CODE}' as Player {PLAYER_NUM}")
+                print(
+                    f">>> Tournament mode — joining room '{CURRENT_ROOM_CODE}'"
+                    f" as Player {PLAYER_NUM}"
+                )
             else:
                 app_room = App_Room()
                 app_room.mainloop()
-                if not app_room.room_ready:
-                    raise SystemExit(0)
-                CURRENT_ROOM_CODE = app_room.room_code
-                PLAYER_NUM        = app_room.player_num
 
-        # Training or after room: launch TimeIn
+                if not getattr(app_room, "room_ready", False):
+                    print(">>> User exited App_Room lobby. Exiting application.")
+                    sys.exit(0)
+
+                CURRENT_ROOM_CODE = app_room.room_code
+                PLAYER_NUM = app_room.player_num
+
+        # 4. PELUNCURAN TIMEIN (LAYAR UTAMA PERMAINAN)
         app = TimeIn()
-        app.after(0, lambda: app.attributes('-zoomed', True) if sys.platform == 'linux' else app.state('zoomed'))
+        app.after(
+            100,
+            lambda: (
+                app.attributes("-zoomed", True)
+                if sys.platform == "linux"
+                else app.state("zoomed")
+            ),
+        )
         app.mainloop()
+
     except SystemExit:
         raise
     except Exception:
