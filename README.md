@@ -1,10 +1,8 @@
-///////////////////
 PENTING: 
 # NUC dengan NDI Webcam aktif:
 CAMERA_INDEX=4
 # Laptop tanpa NDI:
 CAMERA_INDEX=0
-/////////////////////
 
 
 # BDT Desktop App
