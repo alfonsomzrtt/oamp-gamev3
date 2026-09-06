@@ -1,7 +1,7 @@
 PENTING: 
-# NUC dengan NDI Webcam aktif:
+# NUC dengan NDI aktif:
 CAMERA_INDEX=4
-# Laptop tanpa NDI:
+# Tanpa NDI:
 CAMERA_INDEX=0
 
 
