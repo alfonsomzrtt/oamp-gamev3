@@ -27,7 +27,7 @@ load_dotenv(dotenv_path=env_path, override=True)
 
 
 
-ERROR_LOG_PATH = Path(__file__).resolve().parent / "runtime_errors.log"
+ERROR_LOG_PATH = base / "runtime_errors.log"
 
 def log_exception(context, exc_type, exc_value, exc_tb):
     """Log exceptions safely to console and file, bypassing fragile sys.excepthook output."""
@@ -1920,18 +1920,21 @@ cap = None
 
 
 # Informed Consent
-CONSENT_FILE = base / "consent_accepted.txt"
+_APPDATA_DIR = Path(os.environ.get("APPDATA", Path.home())) / "OAMP"
+_APPDATA_DIR.mkdir(parents=True, exist_ok=True)
+CONSENT_FILE = _APPDATA_DIR / "consent_accepted.json"
 CONSENT_VERSION = "1.0" #Naikkan versi ini setiap teks consent diperbarui
 
 def check_consent():
+  print(">>> Memeriksa consent di:", CONSENT_FILE)
   """Memeriksa apakah file persetujuan lokal sudah ada."""
   if not os.path.exists(CONSENT_FILE):
     return False
-    try:
-        with open(CONSENT_FILE, "r", encoding="utf-8") as f:
-            data = _json.load(f)
-        return data.get("accepted") is True and data.get("consent_version") == CONSENT_VERSION
-    except Exception:
+  try:
+     with open(CONSENT_FILE, "r", encoding="utf-8") as f:
+        data = _json.load(f)
+     return data.get("accepted") is True and data.get("consent_version") == CONSENT_VERSION
+  except Exception:
         # File rusak / format lama → anggap belum consent
         return False
 
@@ -2003,11 +2006,11 @@ class App_Consent(customtkinter.CTkToplevel):
             " balok desain (Block Design Test) Otak-Atik Merah Putih"
             " menggunakan aplikasi OAMP Desktop.\n"
             "2. Saya memahami bahwa aplikasi OAMP Desktop memanfaatkan pemrosesan"
-            " Citra Digital/Kamera (Webcam) dan AI untuk mendeteksi gerakan"
-            " tangan serta susunan balok secara otomatis.\n"
+            " Citra Digital/Kamera (Webcam) dan AI untuk mendeteksi"
+            " susunan balok secara otomatis.\n"
             "3. Saya mengizinkan sistem untuk mencatat durasi waktu penyelesaian"
             " tes, level yang berhasil dicapai, serta skor penilaian"
-            " kognitif.\n"
+            " visuospasial.\n"
             "4. Saya memahami bahwa partisipasi ini bersifat sukarela dan saya"
             " berhak menghentikan tes sewaktu-waktu jika merasa tidak nyaman.\n\n"
             "--------------------------------------------------------------------------------\n\n"
@@ -2036,9 +2039,8 @@ class App_Consent(customtkinter.CTkToplevel):
             " kamera & preferensi UI).\n\n"
             "2. Pemrosesan Video & Sensor Kamera:\n"
             "   • ALIRAN VIDEO (STREAM KAMERA) HANYA DIPROSES SECARA REAL-TIME DI"
-            " MEMORI LOKAL PERANGKAT LOKAL ANDA (Client-Side) OLEH MODEL YOLOv5"
-            " & MEDIAPIPE.\n"
-            "   • SISTEM TIDAK MEREKAM, SERVERTIDAK MENYIMPAN, DAN TIDAK MENGUNGGAH"
+            " MEMORI LOKAL PERANGKAT LOKAL ANDA (Client-Side) OLEH MODEL YOLOv5.\n"
+            "   • SISTEM TIDAK MEREKAM, SERVER TIDAK MENYIMPAN, DAN TIDAK MENGUNGGAH"
             " FOTO/VIDEO PERANGKAT KE  CLOUD ATAU PIHAK KETIGA.\n\n"
             "3. Penyimpanan Data Hasil Tes:\n"
             "   • Mode Online: Hasil tes (skor & durasi) dikirimkan ke REST API /"
@@ -5006,6 +5008,7 @@ if __name__ == "__main__":
 
             def on_consent_done():
                 try:
+                    mark_consent_accepted()
                     dummy_root.quit()     # Hentikan mainloop secara bersih
                     dummy_root.destroy()  # Hancurkan window dummy
                 except Exception:
